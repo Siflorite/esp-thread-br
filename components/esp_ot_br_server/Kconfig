@@ -1,0 +1,28 @@
+menu "ESP Thread Border Router Web"
+
+    config ESP_BR_WEB_CLI
+        bool "Enable Web CLI and BR log capture"
+        depends on OPENTHREAD_BR_START_WEB
+        default n
+        help
+            Show a Web CLI in Tools and capture recent BR logs in RAM.
+            OpenThread command execution additionally requires OPENTHREAD_CLI.
+            Disabling this option excludes the backend, log buffer and CLI
+            callback wrappers. The serial console is unaffected.
+
+    config ESP_BR_WEB_CLI_BUFFER_SIZE
+        int "Web CLI log buffer size in bytes"
+        depends on ESP_BR_WEB_CLI
+        range 1024 65536
+        default 16384
+        help
+            Fixed RAM byte ring holding variable-length output fragments.
+            Each fragment uses 12 bytes of metadata plus its actual text length
+            (up to 255 bytes), without padding or a terminating NUL. Oldest
+            whole fragments are overwritten when space is needed. Reading
+            does not remove data, so clients have independent cursors.
+            Defaults to 16 KiB. Ring bookkeeping and HTTP JSON responses use
+            additional memory. Replaces ESP_BR_WEB_CLI_RECORD_COUNT; existing
+            configurations should select a byte budget instead of a count.
+
+endmenu

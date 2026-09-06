@@ -18,6 +18,9 @@
 #include "esp_br_web.h"
 #include "esp_br_web_api.h"
 #include "esp_br_web_base.h"
+#if CONFIG_ESP_BR_WEB_CLI
+#include "esp_br_web_cli.h"
+#endif
 #if CONFIG_OPENTHREAD_BR_SOFTAP_SETUP
 #include "esp_br_wifi_config.h"
 #endif
@@ -272,7 +275,24 @@ static esp_err_t esp_otbr_ipaddr_get_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_add_ipaddr_post_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_delete_ipaddr_post_handler(httpd_req_t *req);
 
+static esp_err_t esp_br_web_features_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+#if CONFIG_ESP_BR_WEB_CLI
+    return httpd_resp_sendstr(req, "{\"web_cli\":true}");
+#else
+    return httpd_resp_sendstr(req, "{\"web_cli\":false}");
+#endif
+}
+
 static httpd_uri_t s_web_gui_handlers[] = {
+    {.uri = "/web/features", .method = HTTP_GET, .handler = esp_br_web_features_get_handler},
+#if CONFIG_ESP_BR_WEB_CLI
+    {.uri = "/cli/events", .method = HTTP_GET, .handler = esp_br_web_cli_events_handler},
+    {.uri = "/cli", .method = HTTP_GET, .handler = esp_br_web_cli_get_handler},
+    {.uri = "/cli", .method = HTTP_POST, .handler = esp_br_web_cli_post_handler},
+#endif
     {
         .uri = ESP_OT_REST_API_PROPERTIES_PATH,
         .method = HTTP_GET,
@@ -1510,6 +1530,9 @@ static httpd_handle_t *start_esp_br_http_server(const char *base_path)
 
     esp_br_web_api_init();
 
+#if CONFIG_ESP_BR_WEB_CLI
+    esp_br_web_cli_stream_start();
+#endif
     // start http_server
     ESP_RETURN_ON_FALSE(!httpd_start(&s_server.handle, &config), NULL, WEB_TAG, "Failed to start web server");
 
@@ -1538,7 +1561,10 @@ Note: Server Stop
 -----------------------------------------------------*/
 void stop_httpserver(httpd_handle_t server)
 {
-    httpd_stop(server); // Stop the httpd server
+#if CONFIG_ESP_BR_WEB_CLI
+    esp_br_web_cli_stream_stop();
+#endif
+    httpd_stop(server); // Stop only after SSE workers release async requests
 }
 
 void disconnect_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
@@ -1639,6 +1665,9 @@ static void handler_got_ip6_event(void *arg, esp_event_base_t event_base, int32_
 void esp_br_web_start(char *base_path)
 {
     ESP_ERROR_CHECK(mdns_register_hostname_changed_callback(mdns_hostname_changed_callback, NULL));
+#if CONFIG_ESP_BR_WEB_CLI
+    esp_br_web_cli_init();
+#endif
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &handler_got_ip_event, base_path));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &handler_got_ip_event, base_path));
 #if CONFIG_LWIP_IPV6
