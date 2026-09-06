@@ -1,0 +1,24 @@
+menu "ESP Thread Border Router Web"
+
+    config ESP_BR_WEB_CLI
+        bool "Enable Web CLI and BR log capture"
+        depends on OPENTHREAD_BR_START_WEB
+        default n
+        help
+            Show a Web CLI in Tools and capture recent BR logs in RAM.
+            OpenThread command execution additionally requires OPENTHREAD_CLI.
+            Disabling this option excludes the backend, log buffer and CLI
+            callback wrappers. The serial console is unaffected.
+
+    config ESP_BR_WEB_CLI_RECORD_COUNT
+        int "Number of buffered Web CLI output fragments"
+        depends on ESP_BR_WEB_CLI
+        range 16 256
+        default 64
+        help
+            Each fragment stores up to 255 text bytes plus metadata and padding
+            (272 bytes per fragment on ESP32-S3). 16 fragments use about 4.25
+            KiB, 64 use 17 KiB, and 256 use 68 KiB of static RAM.
+            HTTP JSON responses also temporarily allocate heap memory.
+
+endmenu

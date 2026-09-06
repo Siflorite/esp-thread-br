@@ -33,6 +33,93 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/WellKnownBrRest"
+  /web/features:
+    get:
+      summary: Read compiled Web UI feature flags
+      responses:
+        "200":
+          description: Uncached feature flags; disabled features should be hidden by the UI.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  web_cli: {type: boolean, description: 'CONFIG_ESP_BR_WEB_CLI is enabled.'}
+  /cli:
+    get:
+      summary: Read recent BR log and OpenThread CLI output
+      description: Shared RAM transcript; requires CONFIG_ESP_BR_WEB_CLI. No authentication. Available on the management network. Responses are not cached.
+      parameters:
+        - in: query
+          name: after
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+          description: Last received cursor; use zero for recent buffered output.
+      responses:
+        "200":
+          description: Up to 16 output fragments from a configurable ring buffer (default 64 fragments).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cursor: {type: integer}
+                  session: {type: integer, description: 'Boot identifier; restart from zero if it changes.'}
+                  ready: {type: boolean, description: 'OpenThread CLI initialized.'}
+                  reset: {type: boolean}
+                  dropped: {type: boolean, description: 'Unread output was overwritten.'}
+                  more: {type: boolean}
+                  records:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        seq: {type: integer}
+                        source: {type: string, enum: [log, cli, input]}
+                        text: {type: string}
+        "400":
+          description: Invalid cursor.
+        "500":
+          description: Insufficient memory.
+    post:
+      summary: Queue one OpenThread CLI command
+      description: >-
+        Requires CONFIG_ESP_BR_WEB_CLI and CONFIG_OPENTHREAD_CLI. Accepts an optional ot prefix. Runs with device
+        privileges and may change configuration or restart the device. The 202 response
+        only acknowledges queuing; read shared CLI output for completion or busy rejection.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [command]
+              properties:
+                command:
+                  type: string
+                  minLength: 1
+                  maxLength: 255
+                  description: At most 255 UTF-8 bytes, with no control characters.
+                  example: ot state
+      responses:
+        "202":
+          description: Queued; observe Done or Error in GET /cli output.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted: {type: boolean}
+        "400":
+          description: Invalid JSON, content type, command, or body length.
+        "408":
+          description: Incomplete request body.
+        "500":
+          description: Insufficient memory.
+        "503":
+          description: CLI disabled, not initialized, or task queue unavailable.
   /diagnostics:
     get:
       tags:

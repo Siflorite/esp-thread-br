@@ -444,3 +444,8 @@ tr:hover td { background: var(--primary-light); }
 .hidden { display: none !important; }
 .text-center { text-align: center; }
 .text-muted { color: var(--text-muted); }
+/* Web CLI */
+.cli-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 16px 0; font-size: 13px; }
+.cli-output { height: 340px; overflow: auto; background: #101820; color: #d8e9dc; padding: 16px; border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.5 monospace; }
+.cli-command { display: flex; align-items: center; gap: 10px; margin: 14px 0; }
+.cli-command .form-input { flex: 1; min-width: 0; font-family: monospace; }
