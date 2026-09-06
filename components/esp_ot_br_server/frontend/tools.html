@@ -17,6 +17,29 @@
     <h1 class="page-title">Tools</h1>
     <p class="page-desc">Network diagnostics and utilities</p>
 
+    <div class="card section hidden" id="webCli">
+        <div class="card-header">Web CLI</div>
+        <p class="form-hint">Live BR logs and OpenThread output (shared with the serial console).
+            Enter <code>ot state</code>, <code>ot ipaddr</code> or <code>ot help</code>.
+            Commands can change the device configuration.</p>
+        <div class="cli-toolbar">
+            <label><input id="cliLogs" type="checkbox" checked> BR LOG</label>
+            <label><input id="cliFollow" type="checkbox" checked> Auto-scroll</label>
+            <button class="btn btn-outline" id="cliPause" type="button">Pause</button>
+            <button class="btn btn-outline" id="cliClear" type="button">Clear</button>
+            <span id="cliStatus" role="status">Connecting...</span>
+        </div>
+        <pre id="cliOutput" class="cli-output" tabindex="0" aria-label="BR logs and OpenThread CLI output"></pre>
+        <form id="cliForm" class="cli-command">
+            <label for="cliInput">&gt;</label>
+            <input class="form-input" id="cliInput" type="text" maxlength="255"
+                   placeholder="ot state" autocomplete="off" spellcheck="false" required>
+            <button class="btn btn-primary" id="cliSend" type="submit" disabled>Send</button>
+        </form>
+        <p class="form-hint">Enter to send; ↑ / ↓ for history. Wait for Done / Error before the next command.
+            Recent output is kept in memory; older output may be overwritten.</p>
+    </div>
+
     <!-- Ping Section -->
     <div class="card section">
         <div class="card-header">Ping (ICMPv6 Echo)</div>
@@ -63,10 +86,14 @@
 <div class="footer">Copyright &copy; 2026 Espressif Systems. All rights reserved.</div>
 
 <script src="/static/api.js"></script>
+<script src="/static/web-cli.js"></script>
 <script>
-/* Disable page if Thread network is not connected */
+/* CLI must remain usable when Thread is disabled or detached. */
 checkThreadState(function(role, connected) {
-    if (!connected) disableManagementPage();
+    if (!connected) {
+        document.getElementById('pingBtn').disabled = true;
+        document.getElementById('pingStatus').textContent = 'Thread network is not connected';
+    }
 });
 
 function startPing() {

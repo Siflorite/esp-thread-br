@@ -33,6 +33,138 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/WellKnownBrRest"
+  /web/features:
+    get:
+      summary: Read compiled Web UI feature flags
+      responses:
+        "200":
+          description: Uncached feature flags; disabled features should be hidden by the UI.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  web_cli: {type: boolean, description: 'CONFIG_ESP_BR_WEB_CLI is enabled.'}
+  /cli/events:
+    get:
+      summary: Subscribe to BR log and CLI output using Server-Sent Events
+      description: |-
+        Requires CONFIG_ESP_BR_WEB_CLI. Shared RAM transcript, no authentication or TLS.
+        At most two subscribers; each owns an asynchronous request and a 4096-byte-stack
+        sender task. POST commands and other requests remain available. No browser polling.
+        Events are records (up to 16 fragments), status (initial/ready change), gap
+        (unread records overwritten), and reset (boot changed or cursor ahead).
+        Every event has id SESSION:SEQ and JSON data with string session, string cursor,
+        and boolean ready. records additionally contains records[{seq,source,text}],
+        where seq is a decimal string and source is log, input, or cli.
+        String IDs preserve 64-bit sequence precision. gap/reset position the cursor
+        immediately before the oldest retained record. Reads do not consume the ring.
+        No ID starts at the oldest retained record without reporting a gap.
+        Comment heartbeats are sent every 10 seconds; retry advice is 3000 ms.
+        Each sender checks the ring every 50 ms and yields after each bounded batch.
+        Send failures close the stream. Clients should recreate a CLOSED EventSource
+        with backoff, including after a 503 response.
+      parameters:
+        - in: header
+          name: Last-Event-ID
+          schema: {type: string, pattern: '^[0-9]+:[0-9]+$'}
+          description: Last fully received event ID. Takes precedence over after.
+        - in: query
+          name: after
+          schema: {type: string, pattern: '^[0-9]+:[0-9]+$'}
+          description: Resume ID for a newly created EventSource (for example after pause).
+      responses:
+        "200":
+          description: Persistent chunked event stream; not a finite JSON response.
+          content:
+            text/event-stream:
+              schema: {type: string}
+              example: |
+                event: records
+                id: 12345:102
+                data: {"session":"12345","cursor":"102","ready":true,"records":[{"seq":"102","source":"cli","text":"leader\r\n"}]}
+
+        "400":
+          description: Invalid resume ID or unexpected request body.
+        "500":
+          description: Insufficient memory or unable to create the asynchronous sender.
+        "503":
+          description: Two subscribers already active, stream unavailable, or server stopping. Retry after 3 seconds.
+  /cli:
+    get:
+      summary: Read recent BR log and CLI output (legacy debug interface; Web UI uses SSE)
+      description: Shared RAM transcript; requires CONFIG_ESP_BR_WEB_CLI. No authentication. Available on the management network. Responses are not cached.
+      parameters:
+        - in: query
+          name: after
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+          description: Last received cursor; use zero for recent buffered output.
+      responses:
+        "200":
+          description: Up to 16 output fragments from a configurable byte ring (default 16 KiB). Each stored fragment uses 12 bytes of metadata plus up to 255 text bytes. Reading does not consume records; oldest whole records are overwritten when full.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cursor: {type: integer}
+                  session: {type: integer, description: 'Boot identifier; restart from zero if it changes.'}
+                  ready: {type: boolean, description: 'OpenThread CLI initialized.'}
+                  reset: {type: boolean}
+                  dropped: {type: boolean, description: 'Unread output was overwritten.'}
+                  more: {type: boolean}
+                  records:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        seq: {type: integer}
+                        source: {type: string, enum: [log, cli, input]}
+                        text: {type: string}
+        "400":
+          description: Invalid cursor.
+        "500":
+          description: Insufficient memory.
+    post:
+      summary: Queue one OpenThread CLI command
+      description: >-
+        Requires CONFIG_ESP_BR_WEB_CLI and CONFIG_OPENTHREAD_CLI. Accepts an optional ot prefix. Runs with device
+        privileges and may change configuration or restart the device. The 202 response
+        only acknowledges queuing; read shared CLI output for completion or busy rejection.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [command]
+              properties:
+                command:
+                  type: string
+                  minLength: 1
+                  maxLength: 255
+                  description: At most 255 UTF-8 bytes, with no control characters.
+                  example: ot state
+      responses:
+        "202":
+          description: Queued; observe Done or Error on GET /cli/events (or legacy GET /cli).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted: {type: boolean}
+        "400":
+          description: Invalid JSON, content type, command, or body length.
+        "408":
+          description: Incomplete request body.
+        "500":
+          description: Insufficient memory.
+        "503":
+          description: CLI disabled, not initialized, or task queue unavailable.
   /diagnostics:
     get:
       tags:
