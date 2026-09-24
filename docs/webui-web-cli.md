@@ -12,21 +12,20 @@ Web CLI 默认关闭，可在项目的 `sdkconfig.defaults` 中配置：
 CONFIG_OPENTHREAD_BR_START_WEB=y
 CONFIG_OPENTHREAD_CLI=y
 CONFIG_ESP_BR_WEB_CLI=y
-CONFIG_ESP_BR_WEB_CLI_RECORD_COUNT=16
+CONFIG_ESP_BR_WEB_CLI_BUFFER_SIZE=16384
 ```
 
 已有 `sdkconfig` 的项目请用 menuconfig 调整实际配置；defaults 不会覆盖已有值。
 
-| 配置 | Web CLI 环形缓冲区常驻 RAM（ESP32-S3） |
-|---|---|
-| `CONFIG_ESP_BR_WEB_CLI` 关闭（默认） | 无缓冲区，后端源文件、日志 hook 和 CLI 链接包装均不编译／启用 |
-| 开启，16 条 | 4,352 字节（4.25 KiB） |
-| 开启，64 条（缓冲条数默认值） | 17,408 字节（17 KiB） |
-| 开启，256 条（上限） | 69,632 字节（68 KiB） |
+缓存改为按字节配置，范围 1–64 KiB，默认 16 KiB。`CONFIG_ESP_BR_WEB_CLI_BUFFER_SIZE` 就是预分配字节数组的大小；此外还有少量环形缓冲管理状态。关闭 `CONFIG_ESP_BR_WEB_CLI` 时，缓存、缓存实现、日志 hook 和 CLI 链接包装均不编译／启用。
 
-以上通过 Xtensa 编译器生成目标文件并检查符号尺寸核算，表中未计入少量全局状态、现有任务的临时栈空间及请求期间的 JSON 堆分配。单次 GET 最多包含 16 个片段，原始文本最多约 4 KiB；cJSON 节点、字符串副本、转义和序列化缓冲还会增加临时内存，实际峰值需上板测量。Web CLI 没有创建独立任务或分配独立任务栈。
+旧配置 `CONFIG_ESP_BR_WEB_CLI_RECORD_COUNT` 不再使用，重新配置时采用新的默认容量；如有自定义需求，请在 menuconfig 或项目配置中显式设置字节数。例如原先 64 条固定记录占约 17 KiB，可改为 `CONFIG_ESP_BR_WEB_CLI_BUFFER_SIZE=16384`。条数不能直接当成字节数迁移。
 
-关闭后 `/cli` 路由不注册；页面从小型 `/web/features` 接口读取编译功能，隐藏 CLI 且不再轮询日志。共享 SPIFFS 内仍保留静态 HTML／JS，这占用 Flash，不会保留设备端的日志环形缓冲。
+每条记录保存 12 字节记录头（序号、文本长度、来源、保留字节），紧跟实际文本，不存结构体对齐填充或字符串结束符。例如 2 字节换行占 14 字节，255 字节片段占 267 字节。默认 16 KiB 在仅包含这两种片段时分别可容纳 1170 条或 61 条；实际容量随文本长度变化。
+
+网页通过 SSE 接收输出，每批最多 16 个片段，原始文本最多约 4 KiB。缓存仍为一个共享字节数组，不为客户端复制。最多允许 2 个 SSE 客户端，每个连接创建一个 4096 字节栈的发送任务，另有任务控制块、HTTP 异步请求副本、TCP 缓冲及 cJSON 临时分配；两客户端仅任务栈就增加 8 KiB，实际内存峰值需上板测量。客户端断开／发送失败后释放请求和任务。无客户端时没有 SSE 任务。旧 GET JSON 接口保留供调试工具使用，网页不再轮询。
+
+关闭后 `/cli` 和 `/cli/events` 路由不注册；页面从小型 `/web/features` 接口读取编译功能，隐藏 CLI 且不建立 SSE 连接。共享 SPIFFS 内仍保留静态 HTML／JS，这占用 Flash，不会保留设备端的日志环形缓冲。
 
 输入 `ot state`、`ot ipaddr` 或 `ot help`，按 Enter 发送；也支持省略 `ot` 前缀。等待 `Done` / `Error` 后再发送下一条。方向键浏览最近 50 条命令，BR LOG 开关隐藏／显示日志，Pause 暂停读取，Clear 只清除当前页面显示。
 
@@ -58,10 +57,14 @@ flowchart LR
     Tee --> Ring[固定大小日志环形缓冲区]
     Log[ESP-IDF 日志回调] --> Ring
     Log --> Console[原日志输出]
-    UI -->|GET /cli?after=cursor| Ring
+    UI -->|GET /cli/events 订阅| SSE[每客户端 SSE 发送任务]
+    Ring -->|按客户端游标复制| SSE
+    SSE -->|records/status/gap/reset| UI
 ```
 
 `esp_br_web_cli.c` 用 `esp_log_set_vprintf()` 复制启动 Web 功能之后的常规 ESP-IDF 日志，继续调用原日志输出函数。日志回调可被多任务调用，缓冲区写入用短临界区保护，格式化、JSON 分配和 HTTP 发送都在临界区之外。
+
+`esp_br_web_cli_ring.c` 实现无动态分配的变长记录字节环形缓冲，由调用者加锁。记录头和文本均可跨缓冲区末尾，按两段复制；空间不足时逐条覆盖最旧的完整记录，不等待客户端。读取不删除记录，各请求以各自的序号续读。读取时每次只在临界区内跳过或复制一条记录，锁外序列化和发送；若读取期间目标记录被覆盖，停止本批读取，发送任务下一轮重新定位并发送 `gap`（旧 GET 接口使用 `dropped`）。
 
 OT 输出不经过 ESP 日志回调。因此链接时通过 `--wrap=otCliInit` 保留并转发原输出回调，同时收集 CLI 输出；没有再次初始化解释器，原扩展命令和串口 REPL 完成通知仍保留。`--wrap=otCliInputLine` 记录命令输入，识别未完成命令并提示 busy；原生 `factoryreset` 的忙时入口保留。完成状态依据 OT 的 `Done`、`Error` 和提示符输出检测，需要在 SDK 升级时检查兼容性。
 
@@ -69,26 +72,75 @@ HTTP POST 通过公开的 `esp_openthread_cli_input()` 复制命令并投递至 
 
 ## 接口及资源边界
 
-完整结构见 `components/esp_ot_br_server/src/openapi.yaml` 的 `/cli`。
+完整结构见 `components/esp_ot_br_server/src/openapi.yaml` 的 `/cli` 和 `/cli/events`。
 
 | 接口 | 行为 |
 |---|---|
-| `GET /cli?after=0` | 返回最近缓冲记录和 cursor、session、ready、reset、dropped、more |
+| `GET /cli/events` | SSE 订阅，先状态后输出；无游标时从当前最旧记录开始 |
+| `GET /cli/events?after=SESSION:SEQ` | 从上次已接收事件续读；原生重连的 `Last-Event-ID` 优先于 URL 参数 |
+| `GET /cli?after=0` | 调试兼容接口：返回最近缓冲记录和 cursor、session、ready、reset、dropped、more |
 | `GET /cli?after=N` | 读取 N 之后的记录；覆写时返回 dropped，重启 session 改变时浏览器从零读取 |
 | `POST /cli`，JSON `{"command":"ot state"}` | 接受单条 1–255 字节命令；拒绝控制字符、无效 JSON、过大请求；不可用时返回 503 |
 
-设备保存可配置的 16–256 个片段（开启后的默认值 64），每片段文本至多 255 字节，超长片段标记 truncated。单次 GET 最多读取 16 个片段。浏览器每秒读取一次，积压时缩短至 100 ms；单页保留最多 800 个片段，隐藏页面或暂停时停止读取，失败后自动重连。记录是输出片段，不保证一个片段恰好是一行。减小缓冲区会更容易在日志密集或页面暂停时丢失较早的输出。
+设备按配置的字节预算保存最近的输出，每片段文本仍至多 255 字节，超长片段标记 truncated；改成字节缓冲不会消除格式化阶段的截断。网页不再周期性发 GET，而使用一个 EventSource。发送任务每轮最多复制 16 个片段，然后让出 CPU 50 ms；空闲时只在 BR 本地检查缓存，每 10 秒发送 SSE 注释心跳。接收/发送均不发生在日志回调中，POST 及其他 Web 请求继续由 HTTP 服务任务处理。单页仍保留最多 800 个片段。暂停、隐藏或离开页面会关闭订阅；恢复时携带最后收到的事件 ID 重连。清屏不重置该 ID，BR 日志也不会被删除。
+
+### SSE 存储、标记与发送
+
+1. 日志／CLI 回调将 `[uint64序号 + uint16长度 + 来源 + 保留字节][实际文本]` 写入共享 byte ring；启动标识 `session` 是独立的全局随机值，不重复存在每条头部。
+2. 每个客户端只维护自己的游标和读取位置；读取时短暂加锁复制一条，锁外 JSON 编码和发送。写入者只会淘汰完整旧记录，不等待客户端。
+3. `records` 事件用本批最后一条的序号作为 `cursor`；SSE `id` 是 `session:cursor`。字符串形式的 session/cursor/seq 避免 JavaScript 对 64 位整数的精度损失。事件用空行结束，完整接收后浏览器才提交其 ID。成功写入 TCP 不代表浏览器已收到，断线恢复以浏览器的 ID 为准。
+
+```text
+event: records
+id: 12345:102
+data: {"session":"12345","cursor":"102","ready":true,"records":[{"seq":"102","source":"cli","text":"leader\r\n"}]}
+
+```
+
+4. `status` 在连接建立及 CLI 可用状态变化时发送；`gap` 表示未读数据已经被覆盖，游标定位到当前最旧记录之前；`reset` 表示启动标识变化或游标超出当前序号范围，同样重新定位。三种事件的 JSON 含 session/cursor/ready，不含 records，均携带新的 ID。
+5. 网络暂断由 EventSource 携带 `Last-Event-ID` 重连（建议间隔 3 秒）；若因 503 等响应进入 CLOSED，前端等待 3 秒重新创建订阅。手动恢复使用 URL `after` 参数，服务器支持冒号或 `%3A`。历史超过缓存范围只能报告 gap，不能恢复丢失日志，也不自动重发命令。
+
+### 长连接资源与退出
+
+最多 2 个 SSE 客户端，超限返回 503；HTTP 服务仍允许 7 个 socket，为命令和普通请求留出空间。每个 SSE 客户端有独立任务，避免一个慢客户端阻塞另一个或阻塞 POST。socket 每次发送等待上限为 2 秒（不是整个事件的绝对期限）；发送失败即退出。任务每轮以非阻塞 peek 检查对端关闭，避免闲置连接一直占着名额。该实现面向当前明文 HTTP 服务，若增加 TLS 必须同时调整这种检测方式。
+
+停止服务器时先禁止新订阅，在生命周期互斥锁下 shutdown 所有异步请求仍持有的 socket，以打断慢发送，再等待任务恰好一次 complete 请求，最后停止 HTTP server。shutdown 不直接 close fd；真正关闭交还 HTTP server，避免已释放 fd 被复用的竞态。生命周期互斥锁不用于日志写入，也不在生产者临界区中执行网络操作。此互斥锁首次启动创建并在后续服务重启时复用。
+
+减小缓冲区、日志产生超过发送速度、长时间暂停都可能丢失较早输出。SSE 消除了网页轮询等待，但不消除 Wi-Fi 省电、网络丢包和 TCP 重传延迟。
 
 不保存历史到 Flash，不包含初始化之前的启动日志，也不保证捕获 ROM／early log、panic、普通 `printf()` 或其他绕过 ESP 日志及 OT CLI 回调的输出。日志级别仍受固件原配置控制。显示使用 `textContent`，去除终端控制序列，设备文本不会作为 HTML 执行。
 
 ## 验证
 
-在仓库根目录执行 `node tools/ci/check_web_cli.js`，已覆盖文本显示／控制序列、日志过滤、命令发送、换行和 UTF-8 长度校验、历史、覆写提示、重启游标复位、断线和清屏。`node --check` 语法检查通过，OpenAPI YAML 解析通过。
+字节缓冲的主机测试（在仓库根目录运行）：
 
-已使用本机 Xtensa ESP32-S3 GCC 和 ESP-IDF v6.1 头文件，对 `esp_br_web.c` 和 `esp_br_web_cli.c` 做编译器语法／类型检查，新增后端在 CLI 启用和禁用两种配置下均通过。完整固件构建尚未通过：原构建及依赖锁引用已不存在的 v6.0.2；临时适配路径后，v6.1 的依赖解析仍因 ethernet_init 相关 Kconfig 条件无法识别而停止。这不是固件链接或设备运行验证。验证日志保留在本机 `tmp/web-cli-build/log/`，原依赖锁已恢复。
+```sh
+cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
+  -I components/esp_ot_br_server/private_include \
+  tools/ci/check_web_cli_ring.c \
+  components/esp_ot_br_server/src/esp_br_web_cli_ring.c \
+  -o /tmp/check_web_cli_ring
+/tmp/check_web_cli_ring
+```
 
-上板还需验证：串口与网页交替执行 `state`；`scan`／`ping` 的异步完成及 busy 提示；大量日志覆写；Thread 停止后的 CLI；设备重启后的重连；确认原串口可继续输入。此次未刷机。
+测试包含记录头／正文回绕、恰好填满、连续淘汰、多读者独立读取、旧游标失效、到达末尾后续读、无效写入，以及与 FIFO 参考模型对照的随机读写。若测试运行器使用 ptrace 导致 LeakSanitizer 无法启动，可用 `ASAN_OPTIONS=detect_leaks=0 /tmp/check_web_cli_ring`，保留地址和未定义行为检查。
 
-Kconfig 改动另已完成关闭、16 条、64 条和仅日志四种配置的目标文件编译；关闭时 HTTP 入口目标文件不存在 Web CLI 后端符号引用。前端测试验证功能关闭时隐藏 CLI、不请求 `/cli`、不启动循环定时器。完整固件链接及运行内存峰值仍未验证。
+SSE 处理器与发送任务的主机测试（直接把 `esp_br_web_cli.c` 编入 mock 的 IDF／FreeRTOS／socket 头，使用仓库内 cJSON，设置 `CONFIG_OPENTHREAD_CLI=0`）：
+
+```sh
+sh tools/ci/check_web_cli_sse.sh
+```
+
+该测试覆盖：严格 ID 解析（32／64 位上界溢出、`%3A` 编码、拒绝残缺和多余字符）、`Last-Event-ID` 优先于 URL、续读／reset／gap 定位、每批最多 16 条且序号连续、发送前 shutdown 且异步请求恰好 complete 一次（complete 返回失败也不重试）、socket 选项／任务创建／异步接管失败时的清理、连接上限 503、停止时中断慢客户端，以及心跳和状态变化事件。它使用确定性的单线程调度与 mock socket，不模拟真实并发任务、lwIP 缓冲和 TCP 时序，因此不能替代上板验证。
+
+字节缓冲主机测试覆盖 7 种容量、共 140,000 次随机／边界写入。本次 SSE 改动使用 `idf` 对应的 ESP-IDF v6.0.1 环境完成 `examples/basic_thread_border_router` 的 ESP32-S3 固件编译链接及 Web SPIFFS 打包，配置为 16 KiB 缓存。未烧写设备，尚未验证板上时延和并发压力。
+
+在仓库根目录执行 `node tools/ci/check_web_cli.js`。Mock EventSource 测试覆盖文本显示／控制序列、日志过滤、POST 命令校验及历史、无网页轮询、超 JavaScript 安全整数的 ID 续传、gap/reset、自动重连及旧连接事件隔离、暂停／隐藏／恢复、bfcache、清屏、800 条上限及功能开关，并确认收到 503 后 EventSource 进入 CLOSED 时由页面按 3 秒退避重建、原生重连期间不重复建连、暂停会取消该退避。Mock EventSource 只验证页面逻辑，不替代真实浏览器与 lwIP 网络验证。
+
+早期实现曾使用本机 Xtensa ESP32-S3 GCC 和 ESP-IDF v6.1 头文件完成编译器语法／类型检查；当时完整构建受 SDK 路径和依赖配置阻塞。这些历史检查不代表当前字节缓冲实现的验证结果。
+
+上板还需验证：串口与网页交替执行 `state`；`scan`／`ping` 的异步完成及 busy 提示；两客户端独立续读及第三客户端重试；慢客户端不阻塞 POST／其他网页；反复暂停／隐藏／断网／重连的堆和任务回收；大量日志覆写的 gap；服务停止期间中止慢发送；设备重启的 reset；确认原串口可继续输入。此次未刷机。
+
+前端测试验证功能关闭时隐藏 CLI、不订阅 SSE、不启动循环定时器。运行内存峰值、4096 字节任务栈水位和实际日志延迟仍需上板验证。
 
 官方参考：[ESP-IDF 日志回调](https://docs.espressif.com/projects/esp-idf/en/release-v4.4/esp32/api-reference/system/log.html)、[OpenThread CLI API](https://openthread.io/reference/group/api-cli)。实际实现以本机 SDK 源码为准。

@@ -1,6 +1,7 @@
 /* SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
  * SPDX-License-Identifier: Apache-2.0 */
 #include <ctype.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -9,27 +10,25 @@
 
 #include "cJSON.h"
 #include "esp_br_web_cli.h"
+#include "esp_br_web_cli_ring.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "lwip/sockets.h"
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 #if CONFIG_OPENTHREAD_CLI
 #include "esp_openthread_cli.h"
 #include "openthread/cli.h"
 #endif
 
 /* Fixed RAM usage; callbacks never allocate, log, or perform network I/O. */
-#define RECORD_COUNT CONFIG_ESP_BR_WEB_CLI_RECORD_COUNT
-#define RECORD_SIZE 256
+#define RECORD_SIZE CLI_RING_TEXT_SIZE
 #define COMMAND_SIZE 256
 #define READ_COUNT 16
-typedef struct {
-    uint64_t seq;
-    char source;
-    char text[RECORD_SIZE];
-} cli_record_t;
-static cli_record_t s_records[RECORD_COUNT];
-static uint64_t s_next = 1;
+static uint8_t s_storage[CONFIG_ESP_BR_WEB_CLI_BUFFER_SIZE];
+static cli_ring_t s_ring = CLI_RING_INITIALIZER(s_storage);
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static vprintf_like_t s_log_output;
 static bool s_ready;
@@ -37,11 +36,9 @@ static uint32_t s_session;
 
 static void append_record(char source, const char *text)
 {
+    size_t length = strlen(text);
     portENTER_CRITICAL(&s_mux);
-    cli_record_t *record = &s_records[(s_next - 1) % RECORD_COUNT];
-    record->seq = s_next++;
-    record->source = source;
-    strlcpy(record->text, text, sizeof(record->text));
+    cli_ring_append(&s_ring, source, text, length);
     portEXIT_CRITICAL(&s_mux);
 }
 
@@ -131,6 +128,26 @@ void __wrap_otCliInputLine(char *line)
 }
 #endif
 
+/* ESP-IDF's HTTP server writes the status line, every extra header and the body
+ * with separate send() calls and leaves Nagle enabled for normal responses (the
+ * TCP_NODELAY path in httpd_txrx.c only covers error responses). Nagle then
+ * withholds the final segment until the previous one is ACKed. That is free on
+ * a wired link, but this server is reachable over Wi-Fi and the BR runs with
+ * modem sleep, so the ACK of the first segment can be buffered by the AP for
+ * hundreds of milliseconds or lost outright -- TCP then answers with a
+ * multi-second retransmission and the browser sees the body only after the
+ * stall. These responses are small and never worth coalescing, so send them
+ * immediately. The option sticks to the socket and therefore also covers every
+ * later request on the same keep-alive connection. */
+static void cli_no_delay(httpd_req_t *req)
+{
+    int fd = httpd_req_to_sockfd(req);
+    int nodelay = 1;
+    if (fd >= 0) {
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+    }
+}
+
 static esp_err_t send_json(httpd_req_t *req, cJSON *json)
 {
     char *body = json ? cJSON_PrintUnformatted(json) : NULL;
@@ -147,6 +164,7 @@ static esp_err_t send_json(httpd_req_t *req, cJSON *json)
 
 esp_err_t esp_br_web_cli_get_handler(httpd_req_t *req)
 {
+    cli_no_delay(req);
     char query[64], value[24];
     uint64_t after = 0;
     if (httpd_req_get_url_query_len(req)) {
@@ -169,20 +187,25 @@ esp_err_t esp_br_web_cli_get_handler(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
     }
     portENTER_CRITICAL(&s_mux);
-    uint64_t end = s_next;
+    uint64_t end = s_ring.next_seq;
+    uint64_t first = s_ring.first_seq;
+    cli_ring_reader_t reader = cli_ring_begin(&s_ring);
     bool ready = s_ready;
     portEXIT_CRITICAL(&s_mux);
-    uint64_t first = end > RECORD_COUNT ? end - RECORD_COUNT : 1;
     bool reset = after >= end;
     bool dropped = !reset && after != 0 && after < first - 1;
     uint64_t cursor = (reset || after < first - 1) ? first - 1 : after;
-    for (int i = 0; i < READ_COUNT && cursor + 1 < end; i++) {
-        cli_record_t record;
+    for (int i = 0; i < READ_COUNT && cursor + 1 < end && reader.seq < end;) {
+        cli_ring_record_t record;
+        bool skip = reader.seq <= cursor;
         portENTER_CRITICAL(&s_mux);
-        record = s_records[cursor % RECORD_COUNT];
+        bool found = cli_ring_read(&s_ring, &reader, skip ? NULL : &record);
         portEXIT_CRITICAL(&s_mux);
-        if (record.seq != cursor + 1) {
+        if (!found) {
             break; /* Producer overtook us; next poll reports the gap. */
+        }
+        if (skip) {
+            continue;
         }
         cJSON *item = cJSON_CreateObject();
         if (!item || !cJSON_AddNumberToObject(item, "seq", (double)record.seq) ||
@@ -196,6 +219,7 @@ esp_err_t esp_br_web_cli_get_handler(httpd_req_t *req)
             return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
         }
         cursor = record.seq;
+        i++;
     }
     cJSON_AddNumberToObject(root, "cursor", (double)cursor);
     cJSON_AddNumberToObject(root, "session", s_session);
@@ -206,8 +230,318 @@ esp_err_t esp_br_web_cli_get_handler(httpd_req_t *req)
     return send_json(req, root);
 }
 
+/* Each subscriber owns one bounded worker, not the HTTP server task. A slow
+ * socket cannot block POST or the other subscriber. No task is created by a
+ * producer callback, and no producer waits for a subscriber. */
+#define SSE_CLIENT_LIMIT 2
+#define SSE_STACK_SIZE 4096
+#define SSE_TICK_MS 50
+#define SSE_HEARTBEAT_MS 10000
+static unsigned s_stream_count;
+static bool s_stream_stopping;
+
+typedef struct {
+    httpd_req_t *req;
+    uint64_t cursor;
+    bool reset;
+} cli_stream_t;
+
+/* Serialize socket shutdown with async completion, never with the producer's
+ * critical section. This prevents fd reuse while server stop cancels sends. */
+static SemaphoreHandle_t s_stream_mutex;
+static cli_stream_t *s_streams[SSE_CLIENT_LIMIT];
+
+void esp_br_web_cli_stream_start(void)
+{
+    if (!s_stream_mutex) s_stream_mutex = xSemaphoreCreateMutex();
+    portENTER_CRITICAL(&s_mux);
+    s_stream_stopping = false;
+    portEXIT_CRITICAL(&s_mux);
+}
+
+void esp_br_web_cli_stream_stop(void)
+{
+    /* Must finish all async requests BEFORE httpd_stop frees their sessions. */
+    portENTER_CRITICAL(&s_mux);
+    s_stream_stopping = true;
+    portEXIT_CRITICAL(&s_mux);
+    if (s_stream_mutex) {
+        xSemaphoreTake(s_stream_mutex, portMAX_DELAY);
+        for (unsigned i = 0; i < SSE_CLIENT_LIMIT; i++) {
+            if (s_streams[i]) shutdown(httpd_req_to_sockfd(s_streams[i]->req), SHUT_RDWR);
+        }
+        xSemaphoreGive(s_stream_mutex);
+    }
+    for (;;) {
+        portENTER_CRITICAL(&s_mux);
+        unsigned active = s_stream_count;
+        portEXIT_CRITICAL(&s_mux);
+        if (!active) return;
+        vTaskDelay(pdMS_TO_TICKS(SSE_TICK_MS));
+    }
+}
+
+static void stream_release(void)
+{
+    portENTER_CRITICAL(&s_mux);
+    s_stream_count--;
+    portEXIT_CRITICAL(&s_mux);
+}
+
+/* Strict decimal parsing preserves all 64 sequence bits (unlike JS numbers).
+ * httpd_query_key_value does not URL-decode, so accept the browser's %3A too. */
+static bool stream_parse_id(const char *text, bool query, uint32_t *session, uint64_t *cursor)
+{
+    uint64_t boot = 0, seq = 0;
+    const char *p = text;
+    if (*p < '0' || *p > '9') return false;
+    while (*p >= '0' && *p <= '9') {
+        if (boot > (UINT32_MAX - (unsigned)(*p - '0')) / 10) return false;
+        boot = boot * 10 + (*p++ - '0');
+    }
+    if (*p == ':') p++;
+    else if (query && !strncmp(p, "%3", 2) && (p[2] == 'A' || p[2] == 'a')) p += 3;
+    else return false;
+    if (*p < '0' || *p > '9') return false;
+    while (*p >= '0' && *p <= '9') {
+        if (seq > (UINT64_MAX - (unsigned)(*p - '0')) / 10) return false;
+        seq = seq * 10 + (*p++ - '0');
+    }
+    if (*p) return false;
+    *session = (uint32_t)boot;
+    *cursor = seq;
+    return true;
+}
+
+static cJSON *stream_payload(uint64_t cursor, bool ready)
+{
+    char seq[24], boot[16];
+    snprintf(seq, sizeof(seq), "%" PRIu64, cursor);
+    snprintf(boot, sizeof(boot), "%" PRIu32, s_session);
+    cJSON *json = cJSON_CreateObject();
+    if (!json || !cJSON_AddStringToObject(json, "session", boot) ||
+        !cJSON_AddStringToObject(json, "cursor", seq) || !cJSON_AddBoolToObject(json, "ready", ready)) {
+        cJSON_Delete(json);
+        return NULL;
+    }
+    return json;
+}
+
+/* Takes ownership of json. A blank line commits an event and its resume ID. */
+static esp_err_t stream_event(httpd_req_t *req, const char *event, uint64_t cursor, cJSON *json)
+{
+    char header[96];
+    int n = snprintf(header, sizeof(header), "event: %s\nid: %" PRIu32 ":%" PRIu64 "\ndata: ",
+                     event, s_session, cursor);
+    char *body = json ? cJSON_PrintUnformatted(json) : NULL;
+    cJSON_Delete(json);
+    if (!body) return ESP_ERR_NO_MEM;
+    esp_err_t err = httpd_resp_send_chunk(req, header, n);
+    if (err == ESP_OK) err = httpd_resp_send_chunk(req, body, strlen(body));
+    if (err == ESP_OK) err = httpd_resp_send_chunk(req, "\n\n", 2);
+    cJSON_free(body);
+    return err;
+}
+
+static void stream_complete(cli_stream_t *stream)
+{
+    xSemaphoreTake(s_stream_mutex, portMAX_DELAY);
+    /* Shut down while this request still owns its session; HTTPD sees EOF
+     * after complete and performs the final close. No queued close/fd race. */
+    shutdown(httpd_req_to_sockfd(stream->req), SHUT_RDWR);
+    esp_err_t err = httpd_req_async_handler_complete(stream->req);
+    for (unsigned i = 0; i < SSE_CLIENT_LIMIT; i++) {
+        if (s_streams[i] == stream) s_streams[i] = NULL;
+    }
+    xSemaphoreGive(s_stream_mutex);
+    /* Even ESP_FAIL from complete means req was freed. Never retry it. */
+    if (err != ESP_OK) ESP_LOGW("br_cli_sse", "Async completion wakeup failed: %d", err);
+    free(stream);
+    stream_release();
+}
+
+static void stream_worker(void *arg)
+{
+    cli_stream_t *stream = arg;
+    httpd_req_t *req = stream->req;
+    uint64_t cursor = stream->cursor;
+    bool initial = true, last_ready = false;
+    TickType_t heartbeat = xTaskGetTickCount();
+    cli_ring_reader_t reader;
+    portENTER_CRITICAL(&s_mux);
+    reader = cli_ring_begin(&s_ring);
+    portEXIT_CRITICAL(&s_mux);
+
+    httpd_resp_set_type(req, "text/event-stream");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "X-Accel-Buffering", "no");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    esp_err_t err = httpd_resp_send_chunk(req, "retry: 3000\n\n", HTTPD_RESP_USE_STRLEN);
+    while (err == ESP_OK) {
+        portENTER_CRITICAL(&s_mux);
+        bool stopping = s_stream_stopping;
+        uint64_t first = s_ring.first_seq, end = s_ring.next_seq;
+        cli_ring_reader_t begin = cli_ring_begin(&s_ring);
+        bool ready = s_ready;
+        portEXIT_CRITICAL(&s_mux);
+        if (stopping) break;
+        /* HTTPD excludes async sockets from its read loop. Detect FIN here so
+         * pause/resume releases scarce slots without waiting for a heartbeat.
+         * This endpoint is plain HTTP, with no request body or pipelining. */
+        char peek;
+        int pending = recv(httpd_req_to_sockfd(req), &peek, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (pending >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) break;
+
+        const char *event = NULL;
+        if ((initial && stream->reset) || cursor >= end) {
+            cursor = first - 1;
+            event = "reset";
+        } else if (cursor < first - 1) {
+            if (!initial || cursor != 0) event = "gap";
+            cursor = first - 1;
+        }
+        if (event || initial || reader.seq < first) reader = begin;
+        if (event) {
+            err = stream_event(req, event, cursor, stream_payload(cursor, ready));
+            if (err != ESP_OK) break;
+        }
+        if (initial || ready != last_ready) {
+            err = stream_event(req, "status", cursor, stream_payload(cursor, ready));
+            if (err != ESP_OK) break;
+            last_ready = ready;
+        }
+        initial = false;
+
+        if (cursor + 1 < end) {
+            cJSON *json = stream_payload(cursor, ready);
+            cJSON *records = json ? cJSON_AddArrayToObject(json, "records") : NULL;
+            if (!records) { cJSON_Delete(json); break; }
+            uint64_t sent_cursor = cursor;
+            unsigned count = 0;
+            /* Bound work even when seeking through a large retained history.
+             * Each read/skip holds the producer lock for at most one fragment. */
+            for (unsigned scanned = 0; scanned < 64 && count < READ_COUNT && reader.seq < end; scanned++) {
+                cli_ring_record_t record;
+                bool skip = reader.seq <= cursor;
+                portENTER_CRITICAL(&s_mux);
+                bool found = cli_ring_read(&s_ring, &reader, skip ? NULL : &record);
+                portEXIT_CRITICAL(&s_mux);
+                if (!found) break; /* Next iteration sends gap and repositions. */
+                if (skip) continue;
+                char seq[24];
+                snprintf(seq, sizeof(seq), "%" PRIu64, record.seq);
+                cJSON *item = cJSON_CreateObject();
+                if (!item || !cJSON_AddStringToObject(item, "seq", seq) ||
+                    !cJSON_AddStringToObject(item, "source", record.source == 'L' ? "log" :
+                                            record.source == 'I' ? "input" : "cli") ||
+                    !cJSON_AddStringToObject(item, "text", record.text) || !cJSON_AddItemToArray(records, item)) {
+                    cJSON_Delete(item);
+                    err = ESP_ERR_NO_MEM;
+                    break;
+                }
+                sent_cursor = record.seq;
+                count++;
+            }
+            if (err == ESP_OK && count) {
+                char seq[24];
+                snprintf(seq, sizeof(seq), "%" PRIu64, sent_cursor);
+                if (!cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(json, "cursor"), seq)) {
+                    err = ESP_ERR_NO_MEM;
+                } else {
+                    err = stream_event(req, "records", sent_cursor, json);
+                    json = NULL;
+                    if (err == ESP_OK) cursor = sent_cursor;
+                }
+            }
+            cJSON_Delete(json);
+        }
+        TickType_t now = xTaskGetTickCount();
+        if (err == ESP_OK && now - heartbeat >= pdMS_TO_TICKS(SSE_HEARTBEAT_MS)) {
+            err = httpd_resp_send_chunk(req, ": heartbeat\n\n", HTTPD_RESP_USE_STRLEN);
+            heartbeat = now;
+        }
+        /* Device-local checking only: there is no browser polling. Yield even
+         * under sustained output, with at most 16 records per 50 ms batch. */
+        if (err == ESP_OK) vTaskDelay(pdMS_TO_TICKS(SSE_TICK_MS));
+    }
+    stream_complete(stream);
+    vTaskDelete(NULL);
+}
+
+esp_err_t esp_br_web_cli_events_handler(httpd_req_t *req)
+{
+    if (req->content_len) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Unexpected body");
+    uint64_t cursor = 0;
+    uint32_t session = s_session;
+    char id[40], query[64];
+    bool has_id = false;
+    size_t header_len = httpd_req_get_hdr_value_len(req, "Last-Event-ID");
+    if (header_len) {
+        /* Native reconnect ID takes precedence over the original query URL. */
+        if (header_len >= sizeof(id) ||
+            httpd_req_get_hdr_value_str(req, "Last-Event-ID", id, sizeof(id)) != ESP_OK ||
+            !stream_parse_id(id, false, &session, &cursor)) {
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid event ID");
+        }
+        has_id = true;
+    } else if (httpd_req_get_url_query_len(req)) {
+        if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+            httpd_query_key_value(query, "after", id, sizeof(id)) != ESP_OK ||
+            !stream_parse_id(id, true, &session, &cursor)) {
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid event cursor");
+        }
+        has_id = true;
+    }
+    portENTER_CRITICAL(&s_mux);
+    bool available = s_stream_mutex && !s_stream_stopping && s_stream_count < SSE_CLIENT_LIMIT;
+    if (available) s_stream_count++;
+    portEXIT_CRITICAL(&s_mux);
+    if (!available) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_hdr(req, "Retry-After", "3");
+        return httpd_resp_sendstr(req, "Web CLI stream limit reached or server stopping");
+    }
+    cli_stream_t *stream = calloc(1, sizeof(*stream));
+    if (!stream) {
+        stream_release();
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+    }
+    stream->cursor = cursor;
+    stream->reset = has_id && session != s_session;
+    cli_no_delay(req);
+    struct timeval timeout = {.tv_sec = 2};
+    if (setsockopt(httpd_req_to_sockfd(req), SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0 ||
+        httpd_req_async_handler_begin(req, &stream->req) != ESP_OK) {
+        /* Do not leave a send timeout on a socket that stays keep-alive for
+         * other endpoints when this request never became a stream. */
+        struct timeval none = {0};
+        setsockopt(httpd_req_to_sockfd(req), SOL_SOCKET, SO_SNDTIMEO, &none, sizeof(none));
+        free(stream);
+        stream_release();
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Cannot start stream");
+    }
+    xSemaphoreTake(s_stream_mutex, portMAX_DELAY);
+    for (unsigned i = 0; i < SSE_CLIENT_LIMIT; i++) {
+        if (!s_streams[i]) { s_streams[i] = stream; break; }
+    }
+    portENTER_CRITICAL(&s_mux);
+    bool stopping = s_stream_stopping;
+    portEXIT_CRITICAL(&s_mux);
+    /* Stop may have scanned the registry while this handler was in begin(). */
+    if (stopping) shutdown(httpd_req_to_sockfd(stream->req), SHUT_RDWR);
+    xSemaphoreGive(s_stream_mutex);
+    if (stopping) {
+        stream_complete(stream);
+    } else if (xTaskCreate(stream_worker, "br_cli_sse", SSE_STACK_SIZE, stream, tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
+        httpd_resp_send_err(stream->req, HTTPD_500_INTERNAL_SERVER_ERROR, "Cannot create stream task");
+        stream_complete(stream);
+    }
+    return ESP_OK;
+}
+
 esp_err_t esp_br_web_cli_post_handler(httpd_req_t *req)
 {
+    cli_no_delay(req);
     /* JSON-only same-origin fetch: reject cross-site browser form submissions. */
     char type[48];
     if (httpd_req_get_hdr_value_str(req, "Content-Type", type, sizeof(type)) != ESP_OK ||

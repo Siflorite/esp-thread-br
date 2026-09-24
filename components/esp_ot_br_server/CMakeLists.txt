@@ -7,7 +7,7 @@ endif()
 
 set(excluded_sources "")
 if(NOT CONFIG_ESP_BR_WEB_CLI)
-    list(APPEND excluded_sources "src/esp_br_web_cli.c")
+    list(APPEND excluded_sources "src/esp_br_web_cli.c" "src/esp_br_web_cli_ring.c")
 endif()
 
 idf_component_register(

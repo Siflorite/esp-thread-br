@@ -289,6 +289,7 @@ static esp_err_t esp_br_web_features_get_handler(httpd_req_t *req)
 static httpd_uri_t s_web_gui_handlers[] = {
     {.uri = "/web/features", .method = HTTP_GET, .handler = esp_br_web_features_get_handler},
 #if CONFIG_ESP_BR_WEB_CLI
+    {.uri = "/cli/events", .method = HTTP_GET, .handler = esp_br_web_cli_events_handler},
     {.uri = "/cli", .method = HTTP_GET, .handler = esp_br_web_cli_get_handler},
     {.uri = "/cli", .method = HTTP_POST, .handler = esp_br_web_cli_post_handler},
 #endif
@@ -1529,6 +1530,9 @@ static httpd_handle_t *start_esp_br_http_server(const char *base_path)
 
     esp_br_web_api_init();
 
+#if CONFIG_ESP_BR_WEB_CLI
+    esp_br_web_cli_stream_start();
+#endif
     // start http_server
     ESP_RETURN_ON_FALSE(!httpd_start(&s_server.handle, &config), NULL, WEB_TAG, "Failed to start web server");
 
@@ -1557,7 +1561,10 @@ Note: Server Stop
 -----------------------------------------------------*/
 void stop_httpserver(httpd_handle_t server)
 {
-    httpd_stop(server); // Stop the httpd server
+#if CONFIG_ESP_BR_WEB_CLI
+    esp_br_web_cli_stream_stop();
+#endif
+    httpd_stop(server); // Stop only after SSE workers release async requests
 }
 
 void disconnect_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)

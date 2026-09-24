@@ -9,9 +9,10 @@
     var logs = document.getElementById('cliLogs');
     var follow = document.getElementById('cliFollow');
     var pause = document.getElementById('cliPause');
-    var cursor = 0, records = [], history = [], historyIndex = 0;
-    var session = null;
-    var paused = false, ready = false, sending = false, stopped = false, timer;
+    var lastEventId = '', records = [], history = [], historyIndex = 0;
+    var paused = false, ready = false, sending = false, stopped = false;
+    var enabled = false, stream = null, featureGeneration = 0, featureTimer, reconnectTimer;
+    send.disabled = true;
 
     function render() {
         var text = records.filter(function(r) { return logs.checked || r.source !== 'log'; })
@@ -28,43 +29,67 @@
         render();
     }
     function notice(text) { add([{source: 'cli', text: '\n[' + text + ']\n'}]); }
-    function schedule(delay) {
-        clearTimeout(timer);
-        if (!stopped) timer = setTimeout(poll, delay);
+    function disconnect() {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+        var old = stream;
+        stream = null; // Ignore already queued events from the old connection.
+        if (old) old.close();
+        ready = false;
+        send.disabled = true;
     }
-    function poll() {
-        if (paused || document.hidden) { schedule(1000); return; }
-        var controller = new AbortController();
-        var timeout = setTimeout(function() { controller.abort(); }, 8000);
-        var delay = 1000;
-        fetch('/cli?after=' + cursor, {cache: 'no-store', signal: controller.signal})
-            .then(function(r) {
-                if (!r.ok) throw new Error('HTTP ' + r.status);
-                return r.json();
-            }).then(function(data) {
-                if (stopped) return;
-                if (session !== null && session !== data.session) {
-                    notice('Device restarted');
-                    session = data.session;
-                    cursor = 0;
-                    delay = 100;
-                    return;
-                }
-                session = data.session;
-                if (data.reset) notice('Device output restarted');
-                if (data.dropped) notice('Older device output was overwritten');
-                add(data.records || []);
-                cursor = data.cursor;
-                ready = data.ready;
-                send.disabled = !ready || sending;
-                status.textContent = paused ? 'Paused' : ready ? 'Connected' : 'Logs connected; OT CLI unavailable';
-                if (data.more) delay = 100;
-            }).catch(function() {
-                ready = false;
-                send.disabled = true;
-                status.textContent = 'Disconnected; reconnecting...';
-                delay = 3000;
-            }).finally(function() { clearTimeout(timeout); schedule(delay); });
+    function connect() {
+        if (stream || reconnectTimer || !enabled || stopped || paused || document.hidden) return;
+        ready = false;
+        send.disabled = true;
+        status.textContent = 'Connecting...';
+        if (typeof EventSource === 'undefined') {
+            status.textContent = 'EventSource unavailable';
+            return; // No polling or fallback GET transport.
+        }
+        // Native reconnect retains Last-Event-ID. Only manually recreated streams
+        // use the query parameter, keeping decimal cursors as strings throughout.
+        var source = new EventSource('/cli/events' + (lastEventId ? '?after=' + encodeURIComponent(lastEventId) : ''));
+        stream = source;
+        var receivedStatus = false;
+        function receive(event) {
+            if (stream !== source || stopped || paused || document.hidden || !enabled) return;
+            var data;
+            try { data = JSON.parse(event.data); } catch (err) { return; }
+            if (!data || typeof data.session !== 'string' || !/^\d+$/.test(data.session) ||
+                typeof data.cursor !== 'string' || !/^\d+$/.test(data.cursor) ||
+                typeof data.ready !== 'boolean' || event.lastEventId !== data.session + ':' + data.cursor) return;
+            if (event.type === 'records' && (!Array.isArray(data.records) || data.records.length > 16 ||
+                !data.records.every(function(r) {
+                    return r && typeof r.seq === 'string' && /^\d+$/.test(r.seq) &&
+                        ['log', 'input', 'cli'].indexOf(r.source) !== -1 && typeof r.text === 'string';
+                }))) return;
+            lastEventId = event.lastEventId;
+            if (event.type === 'gap') notice('Older device output was overwritten');
+            if (event.type === 'reset') notice('Device output restarted');
+            if (event.type === 'records') add(data.records);
+            if (event.type === 'status') receivedStatus = true;
+            ready = receivedStatus && data.ready;
+            send.disabled = !ready || sending;
+            status.textContent = ready ? 'Connected' : 'Logs connected; OT CLI unavailable';
+        }
+        ['status', 'records', 'gap', 'reset'].forEach(function(type) { source.addEventListener(type, receive); });
+        source.onerror = function() {
+            if (stream !== source || stopped || paused || document.hidden || !enabled) return;
+            receivedStatus = false;
+            ready = false;
+            send.disabled = true;
+            status.textContent = 'Disconnected; reconnecting...';
+            // CONNECTING means native Last-Event-ID reconnect is still active.
+            // A fatal HTTP response (e.g. 503) may instead leave it CLOSED.
+            if (source.readyState === 2) {
+                disconnect();
+                reconnectTimer = setTimeout(function() {
+                    reconnectTimer = null;
+                    connect();
+                }, 3000);
+            }
+        };
     }
     document.getElementById('cliForm').addEventListener('submit', function(event) {
         event.preventDefault();
@@ -78,6 +103,7 @@
         send.disabled = true;
         var controller = new AbortController();
         var timeout = setTimeout(function() { controller.abort(); }, 8000);
+        var commandStream = stream;
         fetch('/cli', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({command: command}), signal: controller.signal
@@ -89,14 +115,14 @@
             history = history.slice(-50);
             historyIndex = history.length;
             input.value = '';
-            status.textContent = 'Queued; waiting for CLI output';
+            if (stream === commandStream && ready) status.textContent = 'Queued; waiting for CLI output';
         }).catch(function(err) {
             notice(err.name === 'AbortError' ? 'Request timed out; execution is uncertain. Check output before retrying.' : 'Send failed: ' + err.message);
         }).finally(function() {
             clearTimeout(timeout);
             sending = false;
             send.disabled = !ready;
-            input.focus();
+            if (!stopped && !document.hidden) input.focus();
         });
     });
     input.addEventListener('keydown', function(event) {
@@ -108,12 +134,23 @@
     pause.addEventListener('click', function() {
         paused = !paused;
         pause.textContent = paused ? 'Resume' : 'Pause';
-        status.textContent = paused ? 'Paused' : 'Reconnecting...';
+        if (paused) { disconnect(); status.textContent = 'Paused'; }
+        else connect();
     });
     document.getElementById('cliClear').addEventListener('click', function() { records = []; render(); });
     logs.addEventListener('change', render);
-    window.addEventListener('pagehide', function() { stopped = true; clearTimeout(timer); });
+    document.addEventListener('visibilitychange', function() {
+        if (document.hidden) { disconnect(); status.textContent = paused ? 'Paused' : 'Hidden'; }
+        else connect();
+    });
+    window.addEventListener('pagehide', function() {
+        stopped = true;
+        ++featureGeneration;
+        clearTimeout(featureTimer);
+        disconnect();
+    });
     function loadFeatures() {
+        var generation = ++featureGeneration;
         var controller = new AbortController();
         var timeout = setTimeout(function() { controller.abort(); }, 8000);
         fetch('/web/features', {cache: 'no-store', signal: controller.signal})
@@ -121,15 +158,17 @@
                 if (!r.ok) throw new Error('HTTP ' + r.status);
                 return r.json();
             }).then(function(features) {
-                if (stopped) return;
-                document.getElementById('webCli').classList.toggle('hidden', !features.web_cli);
-                if (features.web_cli) poll();
+                if (stopped || generation !== featureGeneration) return;
+                enabled = !!features.web_cli;
+                document.getElementById('webCli').classList.toggle('hidden', !enabled);
+                if (enabled) connect();
+                else disconnect();
             }).catch(function() {
-                if (!stopped) timer = setTimeout(loadFeatures, 3000);
+                if (!stopped && generation === featureGeneration) featureTimer = setTimeout(loadFeatures, 3000);
             }).finally(function() { clearTimeout(timeout); });
     }
     window.addEventListener('pageshow', function(event) {
-        if (event.persisted) { stopped = false; loadFeatures(); }
+        if (event.persisted) { stopped = false; enabled = false; loadFeatures(); }
     });
     loadFeatures();
 })();
