@@ -12,7 +12,6 @@
 #include <string.h>
 
 #include "esp_check.h"
-#include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
@@ -46,11 +45,8 @@
 #include "esp_ot_wifi_cmd.h"
 #endif
 
-#if CONFIG_OPENTHREAD_BR_AUTO_START || (CONFIG_OPENTHREAD_BR_WIFI_PS_OFF && CONFIG_EXAMPLE_CONNECT_WIFI)
-#include "esp_wifi.h"
-#endif
-
 #if CONFIG_OPENTHREAD_BR_AUTO_START
+#include "esp_wifi.h"
 #include "example_common_private.h"
 #include "protocol_examples_common.h"
 #endif
@@ -96,25 +92,6 @@ static bool wifi_config_save_and_connect(const char *ssid, const char *password)
         return true;
     }
     return false;
-}
-#endif
-
-#if CONFIG_OPENTHREAD_BR_WIFI_PS_OFF && CONFIG_EXAMPLE_CONNECT_WIFI
-/**
- * @brief Undo the modem sleep that esp_ot_wifi_connect() enables.
- *
- * In modem sleep the station only listens for buffered downlink traffic at its
- * listen interval, so the access point delays every frame addressed to it and
- * drops the ones it cannot hold. That includes the TCP ACKs this border router
- * waits for, which turns occasional loss into multi-second retransmissions: the
- * Web UI then answers seconds after a request while commands look instant.
- * Wi-Fi is brought up by the auto-start path, the SoftAP helper or a manual
- * "wifi connect", so restore full-power listening whenever the station gets an
- * address.
- */
-static void wifi_keep_awake_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
-{
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 }
 #endif
 
@@ -204,12 +181,6 @@ static void ot_br_init(void *ctx)
 void launch_openthread_border_router(const esp_openthread_config_t *config,
                                      const esp_rcp_update_config_t *update_config)
 {
-#if CONFIG_OPENTHREAD_BR_WIFI_PS_OFF && CONFIG_EXAMPLE_CONNECT_WIFI
-    /* Register before the station can connect: Wi-Fi may be brought up by the
-     * auto-start task, the SoftAP helper or a manual "wifi connect". */
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_keep_awake_handler, NULL));
-#endif
-
 #if CONFIG_OPENTHREAD_CLI
     ot_console_start();
 #endif

@@ -5,6 +5,10 @@ if("${IDF_VERSION_MAJOR}" VERSION_LESS "6")
     list(APPEND requires json)
 endif()
 
+if(CONFIG_ESP_BR_WEB_CLI AND CONFIG_OPENTHREAD_CLI)
+    list(APPEND requires console)
+endif()
+
 set(excluded_sources "")
 if(NOT CONFIG_ESP_BR_WEB_CLI)
     list(APPEND excluded_sources "src/esp_br_web_cli.c" "src/esp_br_web_cli_ring.c")
@@ -22,8 +26,7 @@ idf_component_register(
 
 spiffs_create_partition_image(web_storage ${CMAKE_CURRENT_SOURCE_DIR}/frontend FLASH_IN_PROJECT)
 
-# Tee the existing CLI callback without reinitializing the interpreter or
-# replacing the serial console's completion notification callback.
+# Capture the same console command execution path used by the serial REPL.
 if(CONFIG_ESP_BR_WEB_CLI AND CONFIG_OPENTHREAD_CLI)
-    target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=otCliInit" "-Wl,--wrap=otCliInputLine")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_console_run")
 endif()

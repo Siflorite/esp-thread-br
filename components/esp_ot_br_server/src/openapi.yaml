@@ -50,8 +50,8 @@ paths:
       summary: Subscribe to BR log and CLI output using Server-Sent Events
       description: |-
         Requires CONFIG_ESP_BR_WEB_CLI. Shared RAM transcript, no authentication or TLS.
-        At most two subscribers; each owns an asynchronous request and a 4096-byte-stack
-        sender task. POST commands and other requests remain available. No browser polling.
+        At most one subscriber, using a fixed context, an asynchronous request and a
+        4096-byte-stack sender task. POST commands and other requests remain available. No browser polling.
         Events are records (up to 16 fragments), status (initial/ready change), gap
         (unread records overwritten), and reset (boot changed or cursor ahead).
         Every event has id SESSION:SEQ and JSON data with string session, string cursor,
@@ -61,7 +61,9 @@ paths:
         immediately before the oldest retained record. Reads do not consume the ring.
         No ID starts at the oldest retained record without reporting a gap.
         Comment heartbeats are sent every 10 seconds; retry advice is 3000 ms.
-        Each sender checks the ring every 50 ms and yields after each bounded batch.
+        The sender checks the ring every 50 ms and yields after each bounded batch.
+        Small console writes are coalesced until newline, 255 bytes, source change or read.
+        Each complete SSE event is submitted as one HTTP chunk; TCP may still split it.
         Send failures close the stream. Clients should recreate a CLOSED EventSource
         with backoff, including after a 503 response.
       parameters:
@@ -89,51 +91,18 @@ paths:
         "500":
           description: Insufficient memory or unable to create the asynchronous sender.
         "503":
-          description: Two subscribers already active, stream unavailable, or server stopping. Retry after 3 seconds.
+          description: A subscriber is already active, stream unavailable, or server stopping. Retry after 3 seconds.
   /cli:
-    get:
-      summary: Read recent BR log and CLI output (legacy debug interface; Web UI uses SSE)
-      description: Shared RAM transcript; requires CONFIG_ESP_BR_WEB_CLI. No authentication. Available on the management network. Responses are not cached.
-      parameters:
-        - in: query
-          name: after
-          schema:
-            type: integer
-            minimum: 0
-            default: 0
-          description: Last received cursor; use zero for recent buffered output.
-      responses:
-        "200":
-          description: Up to 16 output fragments from a configurable byte ring (default 16 KiB). Each stored fragment uses 12 bytes of metadata plus up to 255 text bytes. Reading does not consume records; oldest whole records are overwritten when full.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  cursor: {type: integer}
-                  session: {type: integer, description: 'Boot identifier; restart from zero if it changes.'}
-                  ready: {type: boolean, description: 'OpenThread CLI initialized.'}
-                  reset: {type: boolean}
-                  dropped: {type: boolean, description: 'Unread output was overwritten.'}
-                  more: {type: boolean}
-                  records:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        seq: {type: integer}
-                        source: {type: string, enum: [log, cli, input]}
-                        text: {type: string}
-        "400":
-          description: Invalid cursor.
-        "500":
-          description: Insufficient memory.
     post:
-      summary: Queue one OpenThread CLI command
+      summary: Execute one BR serial-console command
       description: >-
-        Requires CONFIG_ESP_BR_WEB_CLI and CONFIG_OPENTHREAD_CLI. Accepts an optional ot prefix. Runs with device
+        Requires CONFIG_ESP_BR_WEB_CLI and CONFIG_OPENTHREAD_CLI. Passes the command unchanged
+        to esp_console_run, using the same command registry as the serial console.
+        No prefix is added or removed. Runs with device
         privileges and may change configuration or restart the device. The 202 response
-        only acknowledges queuing; read shared CLI output for completion or busy rejection.
+        only acknowledges acceptance by a dedicated command task; read shared console output
+        for completion or busy rejection. A successful console return adds no output.
+        Serial and Web console execution are mutually exclusive.
       requestBody:
         required: true
         content:
@@ -146,11 +115,11 @@ paths:
                   type: string
                   minLength: 1
                   maxLength: 255
-                  description: At most 255 UTF-8 bytes, with no control characters.
+                  description: At most 255 UTF-8 bytes, with no control characters. Leading and trailing spaces are preserved.
                   example: ot state
       responses:
         "202":
-          description: Queued; observe Done or Error on GET /cli/events (or legacy GET /cli).
+          description: Accepted; observe console output on GET /cli/events.
           content:
             application/json:
               schema:
@@ -164,7 +133,7 @@ paths:
         "500":
           description: Insufficient memory.
         "503":
-          description: CLI disabled, not initialized, or task queue unavailable.
+          description: Console disabled, not initialized, or a Web command is still running.
   /diagnostics:
     get:
       tags:

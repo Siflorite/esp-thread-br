@@ -98,6 +98,34 @@ menu "ESP Thread Border Router Example"
         help
             If enabled, a web server will be provided to configure and query Thread network via a Web GUI.
 
+    config ESP_BR_WEB_CLI
+        bool "Enable Web CLI and BR log capture"
+        depends on OPENTHREAD_BR_START_WEB
+        depends on !LIBC_PICOLIBC || LIBC_PICOLIBC_NEWLIB_COMPATIBILITY
+        default n
+        help
+            Show a Web CLI in Tools and capture recent BR logs in RAM.
+            BR console commands use the same registry as the serial REPL and
+            require OPENTHREAD_CLI. Output capture requires task-local stdio
+            (Newlib or Picolibc with Newlib compatibility).
+            Disabling this option excludes the backend, log buffer and
+            console capture wrapper. The serial console is unaffected.
+
+    config ESP_BR_WEB_CLI_BUFFER_SIZE
+        int "Web CLI log buffer size in bytes"
+        depends on ESP_BR_WEB_CLI
+        range 1024 65536
+        default 16384
+        help
+            Fixed RAM byte ring holding variable-length output fragments.
+            Each fragment uses 12 bytes of metadata plus its actual text length
+            (up to 255 bytes), without padding or a terminating NUL. Oldest
+            whole fragments are overwritten when space is needed. Reading
+            does not remove data, so the debug page can resume after reconnect.
+            Defaults to 16 KiB. Ring bookkeeping and HTTP JSON responses use
+            additional memory. Replaces ESP_BR_WEB_CLI_RECORD_COUNT; existing
+            configurations should select a byte budget instead of a count.
+
     config OPENTHREAD_BR_SOFTAP_SETUP
         bool 'Enable SoftAP Wi-Fi configuration mode'
         default n
@@ -105,23 +133,5 @@ menu "ESP Thread Border Router Example"
             If enabled, the border router will start a SoftAP (Access Point) mode when no Wi-Fi
             credentials are found or WiFi connection fails. Users can connect to the AP and
             configure Wi-Fi via a web interface at http://192.168.4.1.
-
-    config OPENTHREAD_BR_WIFI_PS_OFF
-        bool 'Keep the Wi-Fi station awake (disable modem power save)'
-        depends on EXAMPLE_CONNECT_WIFI
-        default n
-        help
-            esp_ot_wifi_connect() puts the Wi-Fi station into modem sleep
-            (WIFI_PS_MAX_MODEM). The access point then buffers every downlink
-            frame until the station's next listen interval and silently drops
-            the frames it cannot hold -- including the TCP ACKs the border
-            router is waiting for, which TCP answers with multi-second
-            retransmissions. The result is a Web UI whose replies arrive
-            seconds after the request while commands appear to be sent
-            instantly.
-
-            Enable this on a mains-powered border router that serves the Web UI:
-            it keeps the radio listening, trading idle current for a responsive
-            UI.
 
 endmenu

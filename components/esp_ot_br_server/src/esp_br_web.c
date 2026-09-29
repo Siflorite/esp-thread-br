@@ -290,7 +290,6 @@ static httpd_uri_t s_web_gui_handlers[] = {
     {.uri = "/web/features", .method = HTTP_GET, .handler = esp_br_web_features_get_handler},
 #if CONFIG_ESP_BR_WEB_CLI
     {.uri = "/cli/events", .method = HTTP_GET, .handler = esp_br_web_cli_events_handler},
-    {.uri = "/cli", .method = HTTP_GET, .handler = esp_br_web_cli_get_handler},
     {.uri = "/cli", .method = HTTP_POST, .handler = esp_br_web_cli_post_handler},
 #endif
     {
