@@ -110,37 +110,4 @@ data: {"session":"12345","cursor":"102","ready":true,"records":[{"seq":"102","so
 
 不保存历史到 Flash，不包含初始化之前的启动日志，也不保证捕获 ROM／early log、panic、普通 `printf()` 或其他绕过 ESP 日志及 OT CLI 回调的输出。日志级别仍受固件原配置控制。显示使用 `textContent`，去除终端控制序列，设备文本不会作为 HTML 执行。
 
-## 验证
-
-字节缓冲的主机测试（在仓库根目录运行）：
-
-```sh
-cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
-  -I components/esp_ot_br_server/private_include \
-  tools/ci/check_web_cli_ring.c \
-  components/esp_ot_br_server/src/esp_br_web_cli_ring.c \
-  -o /tmp/check_web_cli_ring
-/tmp/check_web_cli_ring
-```
-
-测试包含记录头／正文回绕、恰好填满、连续淘汰、多读者独立读取、旧游标失效、到达末尾后续读、无效写入，以及与 FIFO 参考模型对照的随机读写。若测试运行器使用 ptrace 导致 LeakSanitizer 无法启动，可用 `ASAN_OPTIONS=detect_leaks=0 /tmp/check_web_cli_ring`，保留地址和未定义行为检查。
-
-SSE 处理器与发送任务的主机测试（直接把 `esp_br_web_cli.c` 编入 mock 的 IDF／FreeRTOS／socket 头，使用仓库内 cJSON，设置 `CONFIG_OPENTHREAD_CLI=0`）：
-
-```sh
-sh tools/ci/check_web_cli_sse.sh
-```
-
-该测试覆盖：严格 ID 解析（32／64 位上界溢出、`%3A` 编码、拒绝残缺和多余字符）、`Last-Event-ID` 优先于 URL、续读／reset／gap 定位、每批最多 16 条且序号连续、发送前 shutdown 且异步请求恰好 complete 一次（complete 返回失败也不重试）、socket 选项／任务创建／异步接管失败时的清理、连接上限 503、停止时中断慢客户端，以及心跳和状态变化事件。它使用确定性的单线程调度与 mock socket，不模拟真实并发任务、lwIP 缓冲和 TCP 时序，因此不能替代上板验证。
-
-字节缓冲主机测试覆盖 7 种容量、共 140,000 次随机／边界写入。本次 SSE 改动使用 `idf` 对应的 ESP-IDF v6.0.1 环境完成 `examples/basic_thread_border_router` 的 ESP32-S3 固件编译链接及 Web SPIFFS 打包，配置为 16 KiB 缓存。未烧写设备，尚未验证板上时延和并发压力。
-
-在仓库根目录执行 `node tools/ci/check_web_cli.js`。Mock EventSource 测试覆盖文本显示／控制序列、日志过滤、POST 命令校验及历史、无网页轮询、超 JavaScript 安全整数的 ID 续传、gap/reset、自动重连及旧连接事件隔离、暂停／隐藏／恢复、bfcache、清屏、800 条上限及功能开关，并确认收到 503 后 EventSource 进入 CLOSED 时由页面按 3 秒退避重建、原生重连期间不重复建连、暂停会取消该退避。Mock EventSource 只验证页面逻辑，不替代真实浏览器与 lwIP 网络验证。
-
-早期实现曾使用本机 Xtensa ESP32-S3 GCC 和 ESP-IDF v6.1 头文件完成编译器语法／类型检查；当时完整构建受 SDK 路径和依赖配置阻塞。这些历史检查不代表当前字节缓冲实现的验证结果。
-
-上板还需验证：串口与网页交替执行 `state`；`scan`／`ping` 的异步完成及 busy 提示；两客户端独立续读及第三客户端重试；慢客户端不阻塞 POST／其他网页；反复暂停／隐藏／断网／重连的堆和任务回收；大量日志覆写的 gap；服务停止期间中止慢发送；设备重启的 reset；确认原串口可继续输入。此次未刷机。
-
-前端测试验证功能关闭时隐藏 CLI、不订阅 SSE、不启动循环定时器。运行内存峰值、4096 字节任务栈水位和实际日志延迟仍需上板验证。
-
 官方参考：[ESP-IDF 日志回调](https://docs.espressif.com/projects/esp-idf/en/release-v4.4/esp32/api-reference/system/log.html)、[OpenThread CLI API](https://openthread.io/reference/group/api-cli)。实际实现以本机 SDK 源码为准。

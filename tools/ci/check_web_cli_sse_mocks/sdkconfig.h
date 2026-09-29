@@ -1,3 +1,0 @@
-#pragma once
-#define CONFIG_OPENTHREAD_CLI 0
-#define CONFIG_ESP_BR_WEB_CLI_BUFFER_SIZE 4096
