@@ -1,6 +1,5 @@
 /* SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
  * SPDX-License-Identifier: Apache-2.0 */
-#include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdarg.h>
@@ -19,11 +18,10 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #if CONFIG_OPENTHREAD_CLI
-#include "esp_openthread_cli.h"
-#include "openthread/cli.h"
+#include "esp_console.h"
 #endif
 
-/* Fixed RAM usage; callbacks never allocate, log, or perform network I/O. */
+/* Output capture callbacks never allocate, log, or perform network I/O. */
 #define RECORD_SIZE CLI_RING_TEXT_SIZE
 #define COMMAND_SIZE 256
 #define READ_COUNT 16
@@ -33,12 +31,47 @@ static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static vprintf_like_t s_log_output;
 static bool s_ready;
 static uint32_t s_session;
+#if CONFIG_OPENTHREAD_CLI
+static SemaphoreHandle_t s_console_mutex;
+static bool s_command_active;
+/* Log text is captured by log_output(), not again by the console FILE tee. */
+static __thread bool s_forwarding_log;
+#endif
+
+/* OpenThread prints hex output one byte (two characters) at a time.
+ * Accumulate console fragments until newline/full/source change or the next read.
+ * Protected by s_mux; producers still never allocate or wait for network I/O. */
+static char s_cli_pending[RECORD_SIZE];
+static size_t s_cli_pending_length;
+
+static void flush_cli_pending(void)
+{
+    if (s_cli_pending_length) {
+        cli_ring_append(&s_ring, 'C', s_cli_pending, s_cli_pending_length);
+        s_cli_pending_length = 0;
+    }
+}
 
 static void append_record(char source, const char *text)
 {
     size_t length = strlen(text);
     portENTER_CRITICAL(&s_mux);
-    cli_ring_append(&s_ring, source, text, length);
+    if (source == 'C') {
+        /* Keep each formatted callback intact at a capacity boundary so a
+         * UTF-8 character cannot be split between JSON strings. */
+        if (length > sizeof(s_cli_pending) - 1 - s_cli_pending_length) {
+            flush_cli_pending();
+        }
+        for (size_t i = 0; i < length; i++) {
+            s_cli_pending[s_cli_pending_length++] = text[i];
+            if (text[i] == '\n' || s_cli_pending_length == sizeof(s_cli_pending) - 1) {
+                flush_cli_pending();
+            }
+        }
+    } else {
+        flush_cli_pending(); /* Preserve order when logs or commands interleave. */
+        cli_ring_append(&s_ring, source, text, length);
+    }
     portEXIT_CRITICAL(&s_mux);
 }
 
@@ -61,12 +94,24 @@ static void capture(char source, const char *format, va_list args)
 static int log_output(const char *format, va_list args)
 {
     capture('L', format, args);
-    return s_log_output ? s_log_output(format, args) : vprintf(format, args);
+#if CONFIG_OPENTHREAD_CLI
+    bool forwarding = s_forwarding_log;
+    s_forwarding_log = true;
+#endif
+    int result = s_log_output ? s_log_output(format, args) : vprintf(format, args);
+#if CONFIG_OPENTHREAD_CLI
+    s_forwarding_log = forwarding;
+#endif
+    return result;
 }
 
 void esp_br_web_cli_init(void)
 {
-    /* Called once during application startup, before OpenThread starts. */
+    /* Called once during application startup, before the serial console starts. */
+#if CONFIG_OPENTHREAD_CLI
+    if (!s_console_mutex) s_console_mutex = xSemaphoreCreateMutex();
+    s_ready = s_console_mutex != NULL;
+#endif
     if (!s_log_output) {
         s_session = esp_random();
         s_log_output = esp_log_set_vprintf(log_output);
@@ -74,71 +119,91 @@ void esp_br_web_cli_init(void)
 }
 
 #if CONFIG_OPENTHREAD_CLI
-static otCliOutputCallback s_cli_output;
-static void *s_cli_context;
-/* CLI extensions may also emit output from their own tasks. */
-static bool s_busy;
-void __real_otCliInit(otInstance *instance, otCliOutputCallback callback, void *context);
-void __real_otCliInputLine(char *line);
+/* esp_console_run uses shared parsing/argtable storage. Route both the serial
+ * REPL and the Web worker through this wrapper and reject concurrent commands.
+ * The registered OT handler retains IDF's normal queue and completion wait. */
+esp_err_t __real_esp_console_run(const char *line, int *command_result);
 
-static int cli_output(void *context, const char *format, va_list args)
+static int console_write(void *context, const char *text, int length)
 {
-    char marker[16];
-    va_list copy;
-    va_copy(copy, args);
-    vsnprintf(marker, sizeof(marker), format, copy);
-    va_end(copy);
-    if (!strcmp(marker, "> ") || !strcmp(marker, "Done") || !strcmp(marker, "Done\r\n") ||
-        !strncmp(marker, "Error ", 6)) {
-        portENTER_CRITICAL(&s_mux);
-        s_busy = false;
-        portEXIT_CRITICAL(&s_mux);
+    if (!s_forwarding_log) {
+        for (int offset = 0; offset < length;) {
+            char part[RECORD_SIZE];
+            size_t count = (size_t)(length - offset);
+            if (count >= sizeof(part)) {
+                count = sizeof(part) - 1;
+                /* Do not split a UTF-8 character between JSON strings. */
+                while (count && ((unsigned char)text[offset + count] & 0xc0) == 0x80) count--;
+                if (!count) count = sizeof(part) - 1;
+            }
+            memcpy(part, text + offset, count);
+            part[count] = 0;
+            append_record('C', part);
+            offset += count;
+        }
     }
-    capture('C', format, args);
-    /* Preserve IDF's callback: it also wakes the serial REPL on completion. */
-    return s_cli_output(s_cli_context, format, args);
+    /* Forward captured text to the original serial stream. */
+    return (int)fwrite(text, 1, length, (FILE *)context);
 }
 
-void __wrap_otCliInit(otInstance *instance, otCliOutputCallback callback, void *context)
+esp_err_t __wrap_esp_console_run(const char *line, int *command_result)
 {
-    s_cli_output = callback;
-    s_cli_context = context;
-    __real_otCliInit(instance, cli_output, NULL);
-    portENTER_CRITICAL(&s_mux);
-    s_ready = true;
-    portEXIT_CRITICAL(&s_mux);
+    if (!s_console_mutex || xSemaphoreTake(s_console_mutex, 0) != pdTRUE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    FILE *original_stdout = stdout, *original_stderr = stderr;
+    FILE *captured_stdout = funopen(original_stdout, NULL, console_write, NULL, NULL);
+    FILE *captured_stderr = funopen(original_stderr, NULL, console_write, NULL, NULL);
+    if (!captured_stdout || !captured_stderr) {
+        if (captured_stdout) fclose(captured_stdout);
+        if (captured_stderr) fclose(captured_stderr);
+        xSemaphoreGive(s_console_mutex);
+        return ESP_ERR_NO_MEM;
+    }
+    setvbuf(captured_stdout, NULL, _IONBF, 0);
+    setvbuf(captured_stderr, NULL, _IONBF, 0);
+    /* The current SDK uses shared stdout/stderr, so OT task output also passes through this tee. */
+    stdout = captured_stdout;
+    stderr = captured_stderr;
+    append_record('I', line);
+    esp_err_t result = __real_esp_console_run(line, command_result);
+    stdout = original_stdout;
+    stderr = original_stderr;
+    fclose(captured_stdout);
+    fclose(captured_stderr);
+    xSemaphoreGive(s_console_mutex);
+    return result;
 }
 
-void __wrap_otCliInputLine(char *line)
+static void console_worker(void *arg)
 {
-    /* Preserve OpenThread's emergency factoryreset while an async command runs. */
-    bool factory_reset = !strncmp(line, "factoryreset", 12) && (line[12] == 0 || line[12] == ' ');
-    portENTER_CRITICAL(&s_mux);
-    bool rejected = s_busy && !factory_reset;
-    if (!rejected) {
-        s_busy = true;
-    }
-    portEXIT_CRITICAL(&s_mux);
-    if (rejected) {
-        append_record('C', "\r\n[Web CLI: busy; command was not executed. Retry after completion.]\r\n");
+    char *line = arg;
+    int command_result = 0;
+    esp_err_t result = __wrap_esp_console_run(line, &command_result);
+    char message[128];
+    if (result == ESP_ERR_NOT_FOUND) {
+        snprintf(message, sizeof(message), "\r\n[Console: unrecognized command]\r\n");
+    } else if (result == ESP_ERR_INVALID_STATE) {
+        snprintf(message, sizeof(message), "\r\n[Console: busy or unavailable; command was not executed]\r\n");
+    } else if (result != ESP_OK) {
+        snprintf(message, sizeof(message), "\r\n[Console: %s]\r\n", esp_err_to_name(result));
+    } else if (command_result != 0) {
+        snprintf(message, sizeof(message), "\r\n[Console: command returned %d]\r\n", command_result);
     } else {
-        append_record('I', line);
-        __real_otCliInputLine(line);
+        message[0] = 0;
     }
+    if (message[0]) append_record('C', message);
+    free(line);
+    portENTER_CRITICAL(&s_mux);
+    s_command_active = false;
+    portEXIT_CRITICAL(&s_mux);
+    vTaskDelete(NULL);
 }
+
 #endif
 
-/* ESP-IDF's HTTP server writes the status line, every extra header and the body
- * with separate send() calls and leaves Nagle enabled for normal responses (the
- * TCP_NODELAY path in httpd_txrx.c only covers error responses). Nagle then
- * withholds the final segment until the previous one is ACKed. That is free on
- * a wired link, but this server is reachable over Wi-Fi and the BR runs with
- * modem sleep, so the ACK of the first segment can be buffered by the AP for
- * hundreds of milliseconds or lost outright -- TCP then answers with a
- * multi-second retransmission and the browser sees the body only after the
- * stall. These responses are small and never worth coalescing, so send them
- * immediately. The option sticks to the socket and therefore also covers every
- * later request on the same keep-alive connection. */
+/* HTTPD sends headers and chunk framing separately. Disable Nagle for these
+ * latency-sensitive responses so a short write does not wait for an ACK. */
 static void cli_no_delay(httpd_req_t *req)
 {
     int fd = httpd_req_to_sockfd(req);
@@ -148,96 +213,12 @@ static void cli_no_delay(httpd_req_t *req)
     }
 }
 
-static esp_err_t send_json(httpd_req_t *req, cJSON *json)
-{
-    char *body = json ? cJSON_PrintUnformatted(json) : NULL;
-    cJSON_Delete(json);
-    if (!body) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
-    }
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    esp_err_t err = httpd_resp_sendstr(req, body);
-    cJSON_free(body);
-    return err;
-}
-
-esp_err_t esp_br_web_cli_get_handler(httpd_req_t *req)
-{
-    cli_no_delay(req);
-    char query[64], value[24];
-    uint64_t after = 0;
-    if (httpd_req_get_url_query_len(req)) {
-        if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
-            httpd_query_key_value(query, "after", value, sizeof(value)) != ESP_OK || !value[0]) {
-            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid cursor");
-        }
-        for (char *p = value; *p; p++) {
-            if (!isdigit((unsigned char)*p) || after > (UINT64_MAX - (*p - '0')) / 10) {
-                return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid cursor");
-            }
-            after = after * 10 + (*p - '0');
-        }
-    }
-    /* Copy each record under a short critical section; serialize outside it. */
-    cJSON *root = cJSON_CreateObject();
-    cJSON *records = cJSON_AddArrayToObject(root, "records");
-    if (!root || !records) {
-        cJSON_Delete(root);
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
-    }
-    portENTER_CRITICAL(&s_mux);
-    uint64_t end = s_ring.next_seq;
-    uint64_t first = s_ring.first_seq;
-    cli_ring_reader_t reader = cli_ring_begin(&s_ring);
-    bool ready = s_ready;
-    portEXIT_CRITICAL(&s_mux);
-    bool reset = after >= end;
-    bool dropped = !reset && after != 0 && after < first - 1;
-    uint64_t cursor = (reset || after < first - 1) ? first - 1 : after;
-    for (int i = 0; i < READ_COUNT && cursor + 1 < end && reader.seq < end;) {
-        cli_ring_record_t record;
-        bool skip = reader.seq <= cursor;
-        portENTER_CRITICAL(&s_mux);
-        bool found = cli_ring_read(&s_ring, &reader, skip ? NULL : &record);
-        portEXIT_CRITICAL(&s_mux);
-        if (!found) {
-            break; /* Producer overtook us; next poll reports the gap. */
-        }
-        if (skip) {
-            continue;
-        }
-        cJSON *item = cJSON_CreateObject();
-        if (!item || !cJSON_AddNumberToObject(item, "seq", (double)record.seq) ||
-            !cJSON_AddStringToObject(item, "source",
-                                     record.source == 'L'       ? "log"
-                                         : record.source == 'I' ? "input"
-                                                                : "cli") ||
-            !cJSON_AddStringToObject(item, "text", record.text) || !cJSON_AddItemToArray(records, item)) {
-            cJSON_Delete(item);
-            cJSON_Delete(root);
-            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
-        }
-        cursor = record.seq;
-        i++;
-    }
-    cJSON_AddNumberToObject(root, "cursor", (double)cursor);
-    cJSON_AddNumberToObject(root, "session", s_session);
-    cJSON_AddBoolToObject(root, "reset", reset);
-    cJSON_AddBoolToObject(root, "dropped", dropped);
-    cJSON_AddBoolToObject(root, "ready", ready);
-    cJSON_AddBoolToObject(root, "more", cursor + 1 < end);
-    return send_json(req, root);
-}
-
-/* Each subscriber owns one bounded worker, not the HTTP server task. A slow
- * socket cannot block POST or the other subscriber. No task is created by a
- * producer callback, and no producer waits for a subscriber. */
-#define SSE_CLIENT_LIMIT 2
+/* One debug page owns the sender task. Keep network I/O off the HTTP server
+ * task so a slow stream cannot block POST or other Web UI requests. */
 #define SSE_STACK_SIZE 4096
 #define SSE_TICK_MS 50
 #define SSE_HEARTBEAT_MS 10000
-static unsigned s_stream_count;
+static bool s_stream_active;
 static bool s_stream_stopping;
 
 typedef struct {
@@ -249,7 +230,7 @@ typedef struct {
 /* Serialize socket shutdown with async completion, never with the producer's
  * critical section. This prevents fd reuse while server stop cancels sends. */
 static SemaphoreHandle_t s_stream_mutex;
-static cli_stream_t *s_streams[SSE_CLIENT_LIMIT];
+static cli_stream_t s_stream;
 
 void esp_br_web_cli_stream_start(void)
 {
@@ -267,14 +248,12 @@ void esp_br_web_cli_stream_stop(void)
     portEXIT_CRITICAL(&s_mux);
     if (s_stream_mutex) {
         xSemaphoreTake(s_stream_mutex, portMAX_DELAY);
-        for (unsigned i = 0; i < SSE_CLIENT_LIMIT; i++) {
-            if (s_streams[i]) shutdown(httpd_req_to_sockfd(s_streams[i]->req), SHUT_RDWR);
-        }
+        if (s_stream.req) shutdown(httpd_req_to_sockfd(s_stream.req), SHUT_RDWR);
         xSemaphoreGive(s_stream_mutex);
     }
     for (;;) {
         portENTER_CRITICAL(&s_mux);
-        unsigned active = s_stream_count;
+        bool active = s_stream_active;
         portEXIT_CRITICAL(&s_mux);
         if (!active) return;
         vTaskDelay(pdMS_TO_TICKS(SSE_TICK_MS));
@@ -284,7 +263,7 @@ void esp_br_web_cli_stream_stop(void)
 static void stream_release(void)
 {
     portENTER_CRITICAL(&s_mux);
-    s_stream_count--;
+    s_stream_active = false;
     portEXIT_CRITICAL(&s_mux);
 }
 
@@ -336,10 +315,21 @@ static esp_err_t stream_event(httpd_req_t *req, const char *event, uint64_t curs
     char *body = json ? cJSON_PrintUnformatted(json) : NULL;
     cJSON_Delete(json);
     if (!body) return ESP_ERR_NO_MEM;
-    esp_err_t err = httpd_resp_send_chunk(req, header, n);
-    if (err == ESP_OK) err = httpd_resp_send_chunk(req, body, strlen(body));
-    if (err == ESP_OK) err = httpd_resp_send_chunk(req, "\n\n", 2);
+    size_t body_length = strlen(body);
+    size_t length = (size_t)n + body_length + 2;
+    char *frame = malloc(length);
+    if (!frame) {
+        cJSON_free(body);
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(frame, header, n);
+    memcpy(frame + n, body, body_length);
+    memcpy(frame + n + body_length, "\n\n", 2);
     cJSON_free(body);
+    /* Submit the terminating blank line with the payload, not in a later chunk.
+     * TCP may still split it; EventSource dispatches only complete events. */
+    esp_err_t err = httpd_resp_send_chunk(req, frame, length);
+    free(frame);
     return err;
 }
 
@@ -350,13 +340,10 @@ static void stream_complete(cli_stream_t *stream)
      * after complete and performs the final close. No queued close/fd race. */
     shutdown(httpd_req_to_sockfd(stream->req), SHUT_RDWR);
     esp_err_t err = httpd_req_async_handler_complete(stream->req);
-    for (unsigned i = 0; i < SSE_CLIENT_LIMIT; i++) {
-        if (s_streams[i] == stream) s_streams[i] = NULL;
-    }
+    stream->req = NULL;
     xSemaphoreGive(s_stream_mutex);
     /* Even ESP_FAIL from complete means req was freed. Never retry it. */
     if (err != ESP_OK) ESP_LOGW("br_cli_sse", "Async completion wakeup failed: %d", err);
-    free(stream);
     stream_release();
 }
 
@@ -379,6 +366,7 @@ static void stream_worker(void *arg)
     esp_err_t err = httpd_resp_send_chunk(req, "retry: 3000\n\n", HTTPD_RESP_USE_STRLEN);
     while (err == ESP_OK) {
         portENTER_CRITICAL(&s_mux);
+        flush_cli_pending();
         bool stopping = s_stream_stopping;
         uint64_t first = s_ring.first_seq, end = s_ring.next_seq;
         cli_ring_reader_t begin = cli_ring_begin(&s_ring);
@@ -493,37 +481,31 @@ esp_err_t esp_br_web_cli_events_handler(httpd_req_t *req)
         has_id = true;
     }
     portENTER_CRITICAL(&s_mux);
-    bool available = s_stream_mutex && !s_stream_stopping && s_stream_count < SSE_CLIENT_LIMIT;
-    if (available) s_stream_count++;
+    bool available = s_stream_mutex && !s_stream_stopping && !s_stream_active;
+    if (available) s_stream_active = true;
     portEXIT_CRITICAL(&s_mux);
     if (!available) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_set_hdr(req, "Retry-After", "3");
         return httpd_resp_sendstr(req, "Web CLI stream limit reached or server stopping");
     }
-    cli_stream_t *stream = calloc(1, sizeof(*stream));
-    if (!stream) {
-        stream_release();
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
-    }
+    cli_stream_t *stream = &s_stream;
     stream->cursor = cursor;
     stream->reset = has_id && session != s_session;
     cli_no_delay(req);
+    httpd_req_t *async_req = NULL;
     struct timeval timeout = {.tv_sec = 2};
     if (setsockopt(httpd_req_to_sockfd(req), SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0 ||
-        httpd_req_async_handler_begin(req, &stream->req) != ESP_OK) {
+        httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
         /* Do not leave a send timeout on a socket that stays keep-alive for
          * other endpoints when this request never became a stream. */
         struct timeval none = {0};
         setsockopt(httpd_req_to_sockfd(req), SOL_SOCKET, SO_SNDTIMEO, &none, sizeof(none));
-        free(stream);
         stream_release();
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Cannot start stream");
     }
     xSemaphoreTake(s_stream_mutex, portMAX_DELAY);
-    for (unsigned i = 0; i < SSE_CLIENT_LIMIT; i++) {
-        if (!s_streams[i]) { s_streams[i] = stream; break; }
-    }
+    stream->req = async_req;
     portENTER_CRITICAL(&s_mux);
     bool stopping = s_stream_stopping;
     portEXIT_CRITICAL(&s_mux);
@@ -576,33 +558,37 @@ esp_err_t esp_br_web_cli_post_handler(httpd_req_t *req)
     if (!valid) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Expected a command of 1-255 bytes");
     }
-    char *start = line;
-    while (*start == ' ') start++;
-    if (!strncmp(start, "ot ", 3))
-        start += 3;
-    while (*start == ' ') start++;
-    valid = *start != 0;
-    for (char *p = start; *p; p++) {
-        if ((unsigned char)*p < 32 || (unsigned char)*p == 127)
-            valid = false;
+    valid = false;
+    for (const char *p = line; *p; p++) {
+        if ((unsigned char)*p < 32 || (unsigned char)*p == 127) {
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Control characters are not allowed");
+        }
+        if (*p != ' ') valid = true;
     }
     if (!valid) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Enter one non-empty OT command");
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Enter one non-empty console command");
     }
 #if CONFIG_OPENTHREAD_CLI
     portENTER_CRITICAL(&s_mux);
-    bool ready = s_ready;
+    bool available = s_ready && !s_command_active;
+    if (available) s_command_active = true;
     portEXIT_CRITICAL(&s_mux);
-    if (ready) {
-        esp_err_t err = esp_openthread_cli_input(start);
-        if (err == ESP_OK) {
+    if (available) {
+        char *copy = strdup(line);
+        if (copy && xTaskCreate(console_worker, "br_web_console", 8192, copy,
+                                tskIDLE_PRIORITY + 1, NULL) == pdPASS) {
             httpd_resp_set_status(req, "202 Accepted");
             httpd_resp_set_type(req, "application/json");
             httpd_resp_set_hdr(req, "Cache-Control", "no-store");
             return httpd_resp_sendstr(req, "{\"accepted\":true}");
         }
+        free(copy);
+        portENTER_CRITICAL(&s_mux);
+        s_command_active = false;
+        portEXIT_CRITICAL(&s_mux);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Cannot start console command");
     }
 #endif
     httpd_resp_set_status(req, "503 Service Unavailable");
-    return httpd_resp_sendstr(req, "OpenThread CLI unavailable or task queue full");
+    return httpd_resp_sendstr(req, "Console unavailable or a Web command is still running");
 }

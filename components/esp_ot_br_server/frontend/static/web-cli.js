@@ -12,12 +12,13 @@
     var lastEventId = '', records = [], history = [], historyIndex = 0;
     var paused = false, ready = false, sending = false, stopped = false;
     var enabled = false, stream = null, featureGeneration = 0, featureTimer, reconnectTimer;
+    var renderFrame = null;
     send.disabled = true;
 
     function render() {
         var text = records.filter(function(r) { return logs.checked || r.source !== 'log'; })
             .map(function(r) {
-                return r.source === 'input' ? '\n> ot ' + r.text + '\n' : r.text;
+                return r.source === 'input' ? '\n> ' + r.text + '\n' : r.text;
             }).join('');
         // Device text is never HTML; remove terminal color/control sequences.
         output.textContent = text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
@@ -26,7 +27,12 @@
     }
     function add(items) {
         records = records.concat(items).slice(-800);
-        render();
+        if (renderFrame === null) {
+            renderFrame = requestAnimationFrame(function() {
+                renderFrame = null;
+                render();
+            });
+        }
     }
     function notice(text) { add([{source: 'cli', text: '\n[' + text + ']\n'}]); }
     function disconnect() {
@@ -71,7 +77,7 @@
             if (event.type === 'status') receivedStatus = true;
             ready = receivedStatus && data.ready;
             send.disabled = !ready || sending;
-            status.textContent = ready ? 'Connected' : 'Logs connected; OT CLI unavailable';
+            status.textContent = ready ? 'Connected' : 'Logs connected; console unavailable';
         }
         ['status', 'records', 'gap', 'reset'].forEach(function(type) { source.addEventListener(type, receive); });
         source.onerror = function() {
@@ -93,8 +99,8 @@
     }
     document.getElementById('cliForm').addEventListener('submit', function(event) {
         event.preventDefault();
-        var command = input.value.trim();
-        if (!command || sending || !ready) return;
+        var command = input.value;
+        if (!command.trim() || sending || !ready) return;
         if (new TextEncoder().encode(command).length > 255 || /[\x00-\x1f\x7f]/.test(command)) {
             notice('Enter one command, at most 255 UTF-8 bytes');
             return;
@@ -115,7 +121,7 @@
             history = history.slice(-50);
             historyIndex = history.length;
             input.value = '';
-            if (stream === commandStream && ready) status.textContent = 'Queued; waiting for CLI output';
+            if (stream === commandStream && ready) status.textContent = 'Accepted; waiting for console output';
         }).catch(function(err) {
             notice(err.name === 'AbortError' ? 'Request timed out; execution is uncertain. Check output before retrying.' : 'Send failed: ' + err.message);
         }).finally(function() {

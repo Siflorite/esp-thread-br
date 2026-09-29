@@ -19,8 +19,9 @@
 
     <div class="card section hidden" id="webCli">
         <div class="card-header">Web CLI</div>
-        <p class="form-hint">Live BR logs and OpenThread output (shared with the serial console).
-            Enter <code>ot state</code>, <code>ot ipaddr</code> or <code>ot help</code>.
+        <p class="form-hint">Live BR logs and console output (shared with the serial console).
+            Enter serial-console commands such as <code>ot state</code>, <code>ot wifi</code> or <code>help</code>.
+            Input is passed unchanged; no prefix is added or removed.
             Commands can change the device configuration.</p>
         <div class="cli-toolbar">
             <label><input id="cliLogs" type="checkbox" checked> BR LOG</label>
@@ -29,14 +30,14 @@
             <button class="btn btn-outline" id="cliClear" type="button">Clear</button>
             <span id="cliStatus" role="status">Connecting...</span>
         </div>
-        <pre id="cliOutput" class="cli-output" tabindex="0" aria-label="BR logs and OpenThread CLI output"></pre>
+        <pre id="cliOutput" class="cli-output" tabindex="0" aria-label="BR logs and console output"></pre>
         <form id="cliForm" class="cli-command">
             <label for="cliInput">&gt;</label>
             <input class="form-input" id="cliInput" type="text" maxlength="255"
                    placeholder="ot state" autocomplete="off" spellcheck="false" required>
             <button class="btn btn-primary" id="cliSend" type="submit" disabled>Send</button>
         </form>
-        <p class="form-hint">Enter to send; ↑ / ↓ for history. Wait for Done / Error before the next command.
+        <p class="form-hint">Enter to send; ↑ / ↓ for history. Wait for Done / Error or the console command to finish before the next command.
             Recent output is kept in memory; older output may be overwritten.</p>
     </div>
 
