@@ -1,5 +1,5 @@
 <!--
-  SPDX-FileCopyrightText: 2025 Espressif Systems (Shanghai) CO LTD
+  SPDX-FileCopyrightText: 2025-2026 Espressif Systems (Shanghai) CO LTD
   SPDX-License-Identifier: Apache-2.0
 -->
 <!DOCTYPE html>
@@ -27,6 +27,7 @@
             <label><input id="cliLogs" type="checkbox" checked> BR LOG</label>
             <label><input id="cliFollow" type="checkbox" checked> Auto-scroll</label>
             <button class="btn btn-outline" id="cliPause" type="button">Pause</button>
+            <button class="btn btn-outline" id="cliCopyAll" type="button">Copy All</button>
             <button class="btn btn-outline" id="cliClear" type="button">Clear</button>
             <span id="cliStatus" role="status">Connecting...</span>
         </div>
@@ -35,9 +36,9 @@
             <label for="cliInput">&gt;</label>
             <input class="form-input" id="cliInput" type="text" maxlength="255"
                    placeholder="ot state" autocomplete="off" spellcheck="false" required>
-            <button class="btn btn-primary" id="cliSend" type="submit" disabled>Send</button>
+            <button class="btn btn-primary" id="cliSend" type="submit">Send</button>
         </form>
-        <p class="form-hint">Enter to send; ↑ / ↓ for history. Wait for Done / Error or the console command to finish before the next command.
+        <p class="form-hint">Enter to send; ↑ / ↓ for history. Send reports submission only; command results appear in the output.
             Recent output is kept in memory; older output may be overwritten.</p>
     </div>
 

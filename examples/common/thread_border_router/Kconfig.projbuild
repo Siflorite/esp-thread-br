@@ -101,13 +101,14 @@ menu "ESP Thread Border Router Example"
     config ESP_BR_WEB_CLI
         bool "Enable Web CLI and BR log capture"
         depends on OPENTHREAD_BR_START_WEB
+        depends on OPENTHREAD_CLI
         depends on !LIBC_PICOLIBC || LIBC_PICOLIBC_NEWLIB_COMPATIBILITY
         default n
         help
             Show a Web CLI in Tools and capture recent BR logs in RAM.
-            BR console commands use the same registry as the serial REPL and
-            require OPENTHREAD_CLI. Output capture requires task-local stdio
-            (Newlib or Picolibc with Newlib compatibility).
+            Requires OPENTHREAD_CLI. BR console commands use the same registry
+            as the serial REPL. Output capture uses funopen and standard-stream
+            redirection; Picolibc requires Newlib compatibility.
             Disabling this option excludes the backend, log buffer and
             console capture wrapper. The serial console is unaffected.
 

@@ -5,7 +5,7 @@ if("${IDF_VERSION_MAJOR}" VERSION_LESS "6")
     list(APPEND requires json)
 endif()
 
-if(CONFIG_ESP_BR_WEB_CLI AND CONFIG_OPENTHREAD_CLI)
+if(CONFIG_ESP_BR_WEB_CLI)
     list(APPEND requires console)
 endif()
 
@@ -27,6 +27,6 @@ idf_component_register(
 spiffs_create_partition_image(web_storage ${CMAKE_CURRENT_SOURCE_DIR}/frontend FLASH_IN_PROJECT)
 
 # Capture the same console command execution path used by the serial REPL.
-if(CONFIG_ESP_BR_WEB_CLI AND CONFIG_OPENTHREAD_CLI)
+if(CONFIG_ESP_BR_WEB_CLI)
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_console_run")
 endif()

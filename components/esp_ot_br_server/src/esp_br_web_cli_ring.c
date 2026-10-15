@@ -1,5 +1,9 @@
-/* SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
- * SPDX-License-Identifier: Apache-2.0 */
+/*
+ * SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include "esp_br_web_cli_ring.h"
 
 #include <string.h>

@@ -1,8 +1,13 @@
-/* SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
- * SPDX-License-Identifier: Apache-2.0 */
+/*
+ * SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include <errno.h>
 #include <inttypes.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +15,8 @@
 #include "cJSON.h"
 #include "esp_br_web_cli.h"
 #include "esp_br_web_cli_ring.h"
+#include "esp_check.h"
+#include "esp_console.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "lwip/sockets.h"
@@ -17,13 +24,13 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#if CONFIG_OPENTHREAD_CLI
-#include "esp_console.h"
-#endif
+
+#define WEB_CLI_POST_CONTENT_TYPE_SIZE 48
+#define WEB_CLI_POST_BODY_SIZE 1024
 
 /* Output capture callbacks never allocate, log, or perform network I/O. */
 #define RECORD_SIZE CLI_RING_TEXT_SIZE
-#define COMMAND_SIZE 256
+#define WEB_CLI_COMMAND_SIZE 256
 #define READ_COUNT 16
 static uint8_t s_storage[CONFIG_ESP_BR_WEB_CLI_BUFFER_SIZE];
 static cli_ring_t s_ring = CLI_RING_INITIALIZER(s_storage);
@@ -31,12 +38,10 @@ static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static vprintf_like_t s_log_output;
 static bool s_ready;
 static uint32_t s_session;
-#if CONFIG_OPENTHREAD_CLI
 static SemaphoreHandle_t s_console_mutex;
-static bool s_command_active;
-/* Log text is captured by log_output(), not again by the console FILE tee. */
+static atomic_bool s_worker_busy = ATOMIC_VAR_INIT(false);
+// Log text is captured by log_output(), not again by the console FILE tee.
 static __thread bool s_forwarding_log;
-#endif
 
 /* OpenThread prints hex output one byte (two characters) at a time.
  * Accumulate console fragments until newline/full/source change or the next read.
@@ -94,31 +99,26 @@ static void capture(char source, const char *format, va_list args)
 static int log_output(const char *format, va_list args)
 {
     capture('L', format, args);
-#if CONFIG_OPENTHREAD_CLI
     bool forwarding = s_forwarding_log;
     s_forwarding_log = true;
-#endif
     int result = s_log_output ? s_log_output(format, args) : vprintf(format, args);
-#if CONFIG_OPENTHREAD_CLI
     s_forwarding_log = forwarding;
-#endif
     return result;
 }
 
 void esp_br_web_cli_init(void)
 {
-    /* Called once during application startup, before the serial console starts. */
-#if CONFIG_OPENTHREAD_CLI
-    if (!s_console_mutex) s_console_mutex = xSemaphoreCreateMutex();
+    // Called once during application startup, before the serial console starts.
+    if (!s_console_mutex) {
+        s_console_mutex = xSemaphoreCreateMutex();
+    }
     s_ready = s_console_mutex != NULL;
-#endif
     if (!s_log_output) {
         s_session = esp_random();
         s_log_output = esp_log_set_vprintf(log_output);
     }
 }
 
-#if CONFIG_OPENTHREAD_CLI
 /* esp_console_run uses shared parsing/argtable storage. Route both the serial
  * REPL and the Web worker through this wrapper and reject concurrent commands.
  * The registered OT handler retains IDF's normal queue and completion wait. */
@@ -180,7 +180,8 @@ static void console_worker(void *arg)
     char *line = arg;
     int command_result = 0;
     esp_err_t result = __wrap_esp_console_run(line, &command_result);
-    char message[128];
+
+    char message[128] = {0};
     if (result == ESP_ERR_NOT_FOUND) {
         snprintf(message, sizeof(message), "\r\n[Console: unrecognized command]\r\n");
     } else if (result == ESP_ERR_INVALID_STATE) {
@@ -192,15 +193,14 @@ static void console_worker(void *arg)
     } else {
         message[0] = 0;
     }
-    if (message[0]) append_record('C', message);
+    if (message[0]) {
+        append_record('C', message);
+    }
+
     free(line);
-    portENTER_CRITICAL(&s_mux);
-    s_command_active = false;
-    portEXIT_CRITICAL(&s_mux);
+    atomic_store(&s_worker_busy, false);
     vTaskDelete(NULL);
 }
-
-#endif
 
 /* HTTPD sends headers and chunk framing separately. Disable Nagle for these
  * latency-sensitive responses so a short write does not wait for an ACK. */
@@ -523,72 +523,108 @@ esp_err_t esp_br_web_cli_events_handler(httpd_req_t *req)
 
 esp_err_t esp_br_web_cli_post_handler(httpd_req_t *req)
 {
-    cli_no_delay(req);
-    /* JSON-only same-origin fetch: reject cross-site browser form submissions. */
-    char type[48];
+    if (!s_console_mutex) {
+        return httpd_resp_send_custom_err(req, "503 Service Unavailable", "Console unavailable");
+    }
+
+    // Reserve the single command slot before reading or parsing the request body.
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&s_worker_busy, &expected, true)) {
+        return httpd_resp_send_custom_err(req, "503 Service Unavailable", "A Web command is still running");
+    }
+
+    cJSON *json = NULL;
+    char *copy = NULL;
+    httpd_err_code_t error_code = HTTPD_400_BAD_REQUEST;
+    const char *error_message = NULL;
+
+    // Require JSON to reject cross-site browser form submissions.
+    char type[WEB_CLI_POST_CONTENT_TYPE_SIZE];
     if (httpd_req_get_hdr_value_str(req, "Content-Type", type, sizeof(type)) != ESP_OK ||
         (strcmp(type, "application/json") && strcmp(type, "application/json; charset=utf-8"))) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Expected application/json");
+        error_message = "Expected application/json";
+        goto exit;
     }
-    if (req->content_len == 0 || req->content_len >= 1024) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid command length");
+
+    char body[WEB_CLI_POST_BODY_SIZE];
+    if (req->content_len == 0 || req->content_len >= sizeof(body)) {
+        error_message = "Invalid request body length";
+        goto exit;
     }
-    char body[1024];
+
     size_t received = 0;
     while (received < req->content_len) {
         int n = httpd_req_recv(req, body + received, req->content_len - received);
         if (n <= 0) {
-            return httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Incomplete request");
+            error_code = HTTPD_408_REQ_TIMEOUT;
+            error_message = "Incomplete request";
+            goto exit;
         }
         received += n;
     }
-    body[received] = 0;
-    /* cJSON strings cannot represent an embedded NUL without truncation. */
-    if (memchr(body, 0, received) || strstr(body, "\\u0000")) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid command");
+    body[received] = '\0';
+
+    // cJSON strings cannot represent an embedded NUL without truncation.
+    if (memchr(body, '\0', received) || strstr(body, "\\u0000")) {
+        error_message = "Invalid command";
+        goto exit;
     }
-    cJSON *json = cJSON_ParseWithOpts(body, NULL, true);
+
+    json = cJSON_ParseWithOpts(body, NULL, true);
+    if (!json) {
+        error_message = "Invalid JSON";
+        goto exit;
+    }
     cJSON *command = cJSON_GetObjectItemCaseSensitive(json, "command");
-    char line[COMMAND_SIZE];
-    bool valid = cJSON_IsString(command) && command->valuestring && strlen(command->valuestring) < sizeof(line);
-    if (valid) {
-        strcpy(line, command->valuestring);
+    if (!cJSON_IsString(command) || !command->valuestring) {
+        error_message = "Expected a command string";
+        goto exit;
     }
-    cJSON_Delete(json);
-    if (!valid) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Expected a command of 1-255 bytes");
+    const char *line = command->valuestring;
+    if (strlen(line) >= WEB_CLI_COMMAND_SIZE) {
+        error_message = "Expected a command of 1-255 bytes";
+        goto exit;
     }
-    valid = false;
+
+    bool has_non_space = false;
     for (const char *p = line; *p; p++) {
         if ((unsigned char)*p < 32 || (unsigned char)*p == 127) {
-            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Control characters are not allowed");
+            error_message = "Control characters are not allowed";
+            goto exit;
         }
-        if (*p != ' ') valid = true;
-    }
-    if (!valid) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Enter one non-empty console command");
-    }
-#if CONFIG_OPENTHREAD_CLI
-    portENTER_CRITICAL(&s_mux);
-    bool available = s_ready && !s_command_active;
-    if (available) s_command_active = true;
-    portEXIT_CRITICAL(&s_mux);
-    if (available) {
-        char *copy = strdup(line);
-        if (copy && xTaskCreate(console_worker, "br_web_console", 8192, copy,
-                                tskIDLE_PRIORITY + 1, NULL) == pdPASS) {
-            httpd_resp_set_status(req, "202 Accepted");
-            httpd_resp_set_type(req, "application/json");
-            httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-            return httpd_resp_sendstr(req, "{\"accepted\":true}");
+        if (*p != ' ') {
+            has_non_space = true;
         }
-        free(copy);
-        portENTER_CRITICAL(&s_mux);
-        s_command_active = false;
-        portEXIT_CRITICAL(&s_mux);
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Cannot start console command");
     }
-#endif
-    httpd_resp_set_status(req, "503 Service Unavailable");
-    return httpd_resp_sendstr(req, "Console unavailable or a Web command is still running");
+    if (!has_non_space) {
+        error_message = "Expected non-empty console command";
+        goto exit;
+    }
+
+    copy = strdup(line);
+    if (!copy) {
+        error_code = HTTPD_500_INTERNAL_SERVER_ERROR;
+        error_message = "Cannot copy console command";
+        goto exit;
+    }
+    cJSON_Delete(json);
+    json = NULL;
+
+    if (xTaskCreate(console_worker, "br_web_console", 8192, copy, tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
+        error_code = HTTPD_500_INTERNAL_SERVER_ERROR;
+        error_message = "Cannot start console command";
+        goto exit;
+    }
+
+    // The worker owns copy and the command slot, even if sending the response fails.
+    ESP_RETURN_ON_ERROR(httpd_resp_set_status(req, "202 Accepted"), "br_web_cli", "Failed to set response status");
+    ESP_RETURN_ON_ERROR(httpd_resp_set_hdr(req, "Cache-Control", "no-store"), "br_web_cli",
+                        "Failed to set cache control");
+    return httpd_resp_send(req, NULL, 0);
+
+exit:
+    cJSON_Delete(json);
+    free(copy);
+    atomic_store(&s_worker_busy, false);
+    return httpd_resp_send_err(req, error_code, error_message);
 }

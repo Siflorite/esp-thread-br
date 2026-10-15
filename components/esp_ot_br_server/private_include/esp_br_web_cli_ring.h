@@ -1,6 +1,14 @@
-/* SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
- * SPDX-License-Identifier: Apache-2.0 */
+/*
+ * SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #pragma once
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -45,3 +53,7 @@ cli_ring_reader_t cli_ring_begin(const cli_ring_t *ring);
  * record skips one entry without copying its payload. The caller can release
  * its lock between entries, including while skipping to a requested sequence. */
 bool cli_ring_read(const cli_ring_t *ring, cli_ring_reader_t *reader, cli_ring_record_t *record);
+
+#ifdef __cplusplus
+}
+#endif

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2022 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2022-2026 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -261,6 +261,7 @@ static httpd_uri_t s_resource_handlers[] = {
 /*-----------------------------------------------------
 Note: Http Server WEB-GUI API
 -----------------------------------------------------*/
+static esp_err_t esp_br_web_features_get_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_network_properties_get_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_available_networks_get_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_network_join_post_handler(httpd_req_t *req);
@@ -275,22 +276,26 @@ static esp_err_t esp_otbr_ipaddr_get_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_add_ipaddr_post_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_delete_ipaddr_post_handler(httpd_req_t *req);
 
-static esp_err_t esp_br_web_features_get_handler(httpd_req_t *req)
-{
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-#if CONFIG_ESP_BR_WEB_CLI
-    return httpd_resp_sendstr(req, "{\"web_cli\":true}");
-#else
-    return httpd_resp_sendstr(req, "{\"web_cli\":false}");
-#endif
-}
-
 static httpd_uri_t s_web_gui_handlers[] = {
-    {.uri = "/web/features", .method = HTTP_GET, .handler = esp_br_web_features_get_handler},
+    {
+        .uri = ESP_OT_REST_API_WEB_FEATURES_PATH,
+        .method = HTTP_GET,
+        .handler = esp_br_web_features_get_handler,
+        .user_ctx = NULL,
+    },
 #if CONFIG_ESP_BR_WEB_CLI
-    {.uri = "/cli/events", .method = HTTP_GET, .handler = esp_br_web_cli_events_handler},
-    {.uri = "/cli", .method = HTTP_POST, .handler = esp_br_web_cli_post_handler},
+    {
+        .uri = ESP_OT_REST_API_WEB_CLI_EVENTS_PATH,
+        .method = HTTP_GET,
+        .handler = esp_br_web_cli_events_handler,
+        .user_ctx = NULL,
+    },
+    {
+        .uri = ESP_OT_REST_API_WEB_CLI_POST_PATH,
+        .method = HTTP_POST,
+        .handler = esp_br_web_cli_post_handler,
+        .user_ctx = NULL,
+    },
 #endif
     {
         .uri = ESP_OT_REST_API_PROPERTIES_PATH,
@@ -895,6 +900,33 @@ exit:
 /*-----------------------------------------------------
 Note: Openthread WEB GUI API implement
 -----------------------------------------------------*/
+/**
+ * @brief Handle responses of API "/web/features", return the enabled Web UI features as JSON.
+ */
+static esp_err_t esp_br_web_features_get_handler(httpd_req_t *req)
+{
+    esp_err_t ret = ESP_OK;
+#if CONFIG_ESP_BR_WEB_CLI
+    const bool web_cli_enabled = true;
+#else
+    const bool web_cli_enabled = false;
+#endif
+
+    cJSON *response = cJSON_CreateObject();
+    ESP_RETURN_ON_FALSE(response, ESP_ERR_NO_MEM, WEB_TAG, "Failed to create features response");
+    // Web CLI feature
+    ESP_GOTO_ON_FALSE(cJSON_AddBoolToObject(response, "web_cli", web_cli_enabled),
+                      ESP_ERR_NO_MEM, exit, WEB_TAG, "Failed to add Web CLI feature");
+    ESP_GOTO_ON_ERROR(httpd_resp_set_hdr(req, "Cache-Control", "no-store"),
+                      exit, WEB_TAG, "Failed to set cache control");
+    ESP_GOTO_ON_ERROR(httpd_send_packet(req, response),
+                      exit, WEB_TAG, "Failed to response %s", req->uri);
+
+exit:
+    cJSON_Delete(response);
+    return ret;
+}
+
 /**
  * @brief The API would collect the properties of Thread network and send to @param req.
  *

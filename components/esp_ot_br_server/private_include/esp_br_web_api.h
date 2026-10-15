@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2022 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2022-2026 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -59,6 +59,8 @@ void esp_br_web_api_init(void);
 #define ESP_OT_REST_API_AVAILABLE_NETWORK_PATH "/available_network"
 #define ESP_OT_REST_API_NODE_INFORMATION_PATH "/node_information"
 #define ESP_OT_REST_API_TOPOLOGY_PATH "/topology"
+#define ESP_OT_REST_API_WEB_FEATURES_PATH "/web/features"
+#define ESP_OT_REST_API_WEB_CLI_EVENTS_PATH "/cli/events"
 /* HTTP POST */
 #define ESP_OT_REST_API_JOIN_NETWORK_PATH "/join_network"
 #define ESP_OT_REST_API_FORM_NETWORK_PATH "/form_network"
@@ -68,6 +70,7 @@ void esp_br_web_api_init(void);
 #define ESP_OT_REST_API_IPADDR_PATH "/ipaddr"
 #define ESP_OT_REST_API_ADD_IPADDR_PATH "/add_ipaddr"
 #define ESP_OT_REST_API_DELETE_IPADDR_PATH "/delete_ipaddr"
+#define ESP_OT_REST_API_WEB_CLI_POST_PATH "/cli"
 /* To implement in the future */
 #define ESP_OT_REST_API_COMMISSION_PATH "/commission"
 #define ESP_OT_REST_API_NETWORK "/networks"
