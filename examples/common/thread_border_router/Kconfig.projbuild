@@ -102,15 +102,16 @@ menu "ESP Thread Border Router Example"
         bool "Enable Web CLI and BR log capture"
         depends on OPENTHREAD_BR_START_WEB
         depends on OPENTHREAD_CLI
-        depends on !LIBC_PICOLIBC || LIBC_PICOLIBC_NEWLIB_COMPATIBILITY
+        depends on VFS_SUPPORT_SELECT
         default n
         help
-            Show a Web CLI in Tools and capture recent BR logs in RAM.
-            Requires OPENTHREAD_CLI. BR console commands use the same registry
-            as the serial REPL. Output capture uses funopen and standard-stream
-            redirection; Picolibc requires Newlib compatibility.
-            Disabling this option excludes the backend, log buffer and
-            console capture wrapper. The serial console is unaffected.
+            Show a Web CLI in Tools using the existing native console task.
+            Both inputs use fixed 80 columns and retain SDK-selected full/basic
+            editing. Do not use serial and Web simultaneously or switch from
+            an unfinished serial line or active Tab completion.
+            stdout/stderr are forwarded to the console and copied as raw bytes
+            to RAM, without a log hook or command wrapper. Disabling this option
+            excludes capture/Web CLI and restores the original serial startup.
 
     config ESP_BR_WEB_CLI_BUFFER_SIZE
         int "Web CLI log buffer size in bytes"
@@ -119,7 +120,7 @@ menu "ESP Thread Border Router Example"
         default 16384
         help
             Fixed RAM byte ring holding variable-length output fragments.
-            Each fragment uses 12 bytes of metadata plus its actual text length
+            Each fragment uses 12 bytes of metadata plus its raw payload length
             (up to 255 bytes), without padding or a terminating NUL. Oldest
             whole fragments are overwritten when space is needed. Reading
             does not remove data, so the debug page can resume after reconnect.

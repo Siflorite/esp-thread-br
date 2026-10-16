@@ -8,7 +8,6 @@
     var output = document.getElementById('cliOutput');
     var input = document.getElementById('cliInput');
     var status = document.getElementById('cliStatus');
-    var logs = document.getElementById('cliLogs');
     var follow = document.getElementById('cliFollow');
     var pause = document.getElementById('cliPause');
     var lastEventId = '', records = [], history = [], historyIndex = 0;
@@ -16,14 +15,52 @@
     var enabled = false, stream = null, featureGeneration = 0, featureTimer, reconnectTimer;
     var renderFrame = null;
 
+    // Replay current-line console redraws, not locally generated command echoes.
+    // Join SSE fragments first so a split escape sequence is still one operation.
+    function consoleText(text) {
+        var lines = [], line = [], column = 0;
+        var tokens = /\x1b\[([0-?]*)([ -/]*)([@-~])|([\s\S])/gu;
+        var token;
+        while ((token = tokens.exec(text)) !== null) {
+            if (token[3]) {
+                // Support current-line editing, not a full terminal emulator.
+                // Ignore colors and other terminal controls, as in the log view.
+                if (token[2] || !/^\d*$/.test(token[1])) continue;
+                var value = Number(token[1]), step = value || 1;
+                var limit = Math.max(80, line.length);
+                switch (token[3]) {
+                case 'C': column = Math.min(limit, column + step); break;
+                case 'D': column = Math.max(0, column - step); break;
+                case 'G': column = Math.min(limit, Math.max(0, step - 1)); break;
+                case 'K':
+                    if (value === 0) line.length = Math.min(column, line.length);
+                    else if (value === 1) {
+                        for (var i = 0; i <= column && i < line.length; i++) line[i] = ' ';
+                    } else if (value === 2) line = [];
+                    break;
+                }
+                continue;
+            }
+            var character = token[4];
+            // An unfinished CSI at the end will be replayed on the next render.
+            if (character === '\x1b' && /^\x1b\[[0-?]*[ -/]*$/.test(text.slice(token.index))) break;
+            if (character === '\r') column = 0;
+            else if (character === '\n') {
+                lines.push(line.join(''));
+                line = [];
+                column = 0;
+            } else if (character === '\b') column = Math.max(0, column - 1);
+            else if (character === '\t' || (character >= ' ' && character !== '\x7f')) {
+                while (line.length < column) line.push(' ');
+                line[column++] = character;
+            }
+        }
+        lines.push(line.join(''));
+        return lines.join('\n');
+    }
+
     function render() {
-        var text = records.filter(function(r) { return logs.checked || r.source !== 'log'; })
-            .map(function(r) {
-                return r.source === 'input' ? '\n> ' + r.text + '\n' : r.text;
-            }).join('');
-        // Join fragments before detecting log levels, and keep device text out of HTML.
-        text = text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
-            .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
+        var text = consoleText(records.map(function(r) { return r.text; }).join(''));
         var fragment = document.createDocumentFragment();
         var classes = {I: 'cli-log-info', W: 'cli-log-warning', E: 'cli-log-error'};
         var logLine = /^([IWE])[ \t]*\([\d:. -]+\)[^\n]*(?:\n|$)/gm;
@@ -50,7 +87,7 @@
             });
         }
     }
-    function notice(text) { add([{source: 'cli', text: '\n[' + text + ']\n'}]); }
+    function notice(text) { add([{text: '\n[' + text + ']\n'}]); }
     function disconnect() {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -79,7 +116,7 @@
             if (event.type === 'records' && (!Array.isArray(data.records) || data.records.length > 16 ||
                 !data.records.every(function(r) {
                     return r && typeof r.seq === 'string' && /^\d+$/.test(r.seq) &&
-                        ['log', 'input', 'cli'].indexOf(r.source) !== -1 && typeof r.text === 'string';
+                        r.source === 'cli' && typeof r.text === 'string';
                 }))) return;
             lastEventId = event.lastEventId;
             if (event.type === 'gap') notice('Older device output was overwritten');
@@ -188,7 +225,6 @@
         }
     });
     document.getElementById('cliClear').addEventListener('click', function() { records = []; render(); });
-    logs.addEventListener('change', render);
     document.addEventListener('visibilitychange', function() {
         if (document.hidden) { disconnect(); status.textContent = paused ? 'Paused' : 'Hidden'; }
         else connect();

@@ -6,12 +6,16 @@ if("${IDF_VERSION_MAJOR}" VERSION_LESS "6")
 endif()
 
 if(CONFIG_ESP_BR_WEB_CLI)
-    list(APPEND requires console)
+    # Reserve VFS registrations for the tee plus the standard BR devices/mounts.
+    if(CONFIG_VFS_MAX_COUNT LESS 9)
+        message(FATAL_ERROR "Web CLI requires CONFIG_VFS_MAX_COUNT >= 9 for the BR VFS budget; set it to 10 in sdkconfig/menuconfig.")
+    endif()
+    list(APPEND requires console vfs esp_stdio)
 endif()
 
 set(excluded_sources "")
 if(NOT CONFIG_ESP_BR_WEB_CLI)
-    list(APPEND excluded_sources "src/esp_br_web_cli.c" "src/esp_br_web_cli_ring.c")
+    list(APPEND excluded_sources "src/esp_br_web_cli.c" "src/esp_br_web_cli_console.c" "src/esp_br_web_cli_ring.c")
 endif()
 
 idf_component_register(
@@ -25,8 +29,3 @@ idf_component_register(
 )
 
 spiffs_create_partition_image(web_storage ${CMAKE_CURRENT_SOURCE_DIR}/frontend FLASH_IN_PROJECT)
-
-# Capture the same console command execution path used by the serial REPL.
-if(CONFIG_ESP_BR_WEB_CLI)
-    target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_console_run")
-endif()

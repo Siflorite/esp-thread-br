@@ -84,6 +84,7 @@ bool cli_ring_read(const cli_ring_t *ring, cli_ring_reader_t *reader, cli_ring_r
     if (record) {
         record->seq = seq;
         record->source = (char)header[10];
+        record->length = length;
         copy_from_ring(ring, (reader->offset + sizeof(header)) % ring->capacity, record->text, length);
         record->text[length] = 0;
     }

@@ -40,12 +40,14 @@ typedef struct {
 typedef struct {
     uint64_t seq;
     char source;
-    char text[CLI_RING_TEXT_SIZE];
+    size_t length;
+    char text[CLI_RING_TEXT_SIZE]; // Raw payload; use length, not strlen().
 } cli_ring_record_t;
 
 /* Caller serializes ALL access, including reader creation. No allocation or I/O.
  * Append evicts whole oldest records as needed. Invalid/oversize writes leave
- * the ring unchanged. Text is stored without a terminating NUL. */
+ * the ring unchanged. Payload is opaque bytes, including embedded NUL, stored
+ * without a terminator. Fragment boundaries have no character semantics. */
 bool cli_ring_append(cli_ring_t *ring, char source, const char *text, size_t length);
 cli_ring_reader_t cli_ring_begin(const cli_ring_t *ring);
 /* Each reader is independent; reads do not consume the shared transcript.

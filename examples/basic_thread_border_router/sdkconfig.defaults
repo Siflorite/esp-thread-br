@@ -116,3 +116,6 @@ CONFIG_EXAMPLE_ETH_PHY_ADDR=1
 # http server
 #
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+
+# VFS registrations, including the Web CLI tee and RCP UART.
+CONFIG_VFS_MAX_COUNT=10

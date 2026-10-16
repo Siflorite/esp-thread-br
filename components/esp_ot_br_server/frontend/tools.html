@@ -21,10 +21,10 @@
         <div class="card-header">Web CLI</div>
         <p class="form-hint">Live BR logs and console output (shared with the serial console).
             Enter serial-console commands such as <code>ot state</code>, <code>ot wifi</code> or <code>help</code>.
-            Input is passed unchanged; no prefix is added or removed.
-            Commands can change the device configuration.</p>
+            No prefix is added or removed; native console input editing rules still apply.
+            Commands can change the device configuration.
+            Do not use serial and Web input simultaneously, or switch from an unfinished serial line or command.</p>
         <div class="cli-toolbar">
-            <label><input id="cliLogs" type="checkbox" checked> BR LOG</label>
             <label><input id="cliFollow" type="checkbox" checked> Auto-scroll</label>
             <button class="btn btn-outline" id="cliPause" type="button">Pause</button>
             <button class="btn btn-outline" id="cliCopyAll" type="button">Copy All</button>

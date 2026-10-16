@@ -12,6 +12,9 @@
 #include <string.h>
 
 #include "esp_check.h"
+#if CONFIG_ESP_BR_WEB_CLI
+#include "esp_br_web_cli_console.h"
+#endif
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
@@ -182,7 +185,11 @@ void launch_openthread_border_router(const esp_openthread_config_t *config,
                                      const esp_rcp_update_config_t *update_config)
 {
 #if CONFIG_OPENTHREAD_CLI
+#if CONFIG_ESP_BR_WEB_CLI
+    esp_br_web_cli_console_start();
+#else
     ot_console_start();
+#endif
 #endif
 
 #if CONFIG_ESP_COEX_EXTERNAL_COEXIST_ENABLE

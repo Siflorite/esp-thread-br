@@ -5,20 +5,22 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
-#include <stdarg.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "cJSON.h"
 #include "esp_br_web_cli.h"
 #include "esp_br_web_cli_ring.h"
 #include "esp_check.h"
-#include "esp_console.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_stdio.h"
+#include "esp_vfs.h"
 #include "lwip/sockets.h"
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
@@ -28,24 +30,15 @@
 #define WEB_CLI_POST_CONTENT_TYPE_SIZE 48
 #define WEB_CLI_POST_BODY_SIZE 1024
 
-/* Output capture callbacks never allocate, log, or perform network I/O. */
 #define RECORD_SIZE CLI_RING_TEXT_SIZE
-#define WEB_CLI_COMMAND_SIZE 256
 #define READ_COUNT 16
 static uint8_t s_storage[CONFIG_ESP_BR_WEB_CLI_BUFFER_SIZE];
 static cli_ring_t s_ring = CLI_RING_INITIALIZER(s_storage);
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
-static vprintf_like_t s_log_output;
 static bool s_ready;
 static uint32_t s_session;
-static SemaphoreHandle_t s_console_mutex;
-static atomic_bool s_worker_busy = ATOMIC_VAR_INIT(false);
-// Log text is captured by log_output(), not again by the console FILE tee.
-static __thread bool s_forwarding_log;
 
-/* OpenThread prints hex output one byte (two characters) at a time.
- * Accumulate console fragments until newline/full/source change or the next read.
- * Protected by s_mux; producers still never allocate or wait for network I/O. */
+// Batch small writes as raw bytes. No formatting or character interpretation.
 static char s_cli_pending[RECORD_SIZE];
 static size_t s_cli_pending_length;
 
@@ -57,149 +50,126 @@ static void flush_cli_pending(void)
     }
 }
 
-static void append_record(char source, const char *text)
+static void append_console_bytes(const char *data, size_t length)
 {
-    size_t length = strlen(text);
-    portENTER_CRITICAL(&s_mux);
-    if (source == 'C') {
-        /* Keep each formatted callback intact at a capacity boundary so a
-         * UTF-8 character cannot be split between JSON strings. */
-        if (length > sizeof(s_cli_pending) - 1 - s_cli_pending_length) {
-            flush_cli_pending();
-        }
-        for (size_t i = 0; i < length; i++) {
-            s_cli_pending[s_cli_pending_length++] = text[i];
-            if (text[i] == '\n' || s_cli_pending_length == sizeof(s_cli_pending) - 1) {
-                flush_cli_pending();
-            }
-        }
-    } else {
-        flush_cli_pending(); /* Preserve order when logs or commands interleave. */
-        cli_ring_append(&s_ring, source, text, length);
-    }
-    portEXIT_CRITICAL(&s_mux);
-}
-
-static void capture(char source, const char *format, va_list args)
-{
-    char text[RECORD_SIZE];
-    va_list copy;
-    va_copy(copy, args);
-    int length = vsnprintf(text, sizeof(text), format, copy);
-    va_end(copy);
-    if (length > 0) {
-        if ((size_t)length >= sizeof(text)) {
-            static const char truncated[] = " [truncated]\r\n";
-            memcpy(text + sizeof(text) - sizeof(truncated), truncated, sizeof(truncated));
-        }
-        append_record(source, text);
+    while (length) {
+        portENTER_CRITICAL(&s_mux);
+        size_t count = sizeof(s_cli_pending) - 1 - s_cli_pending_length;
+        if (count > length) count = length;
+        memcpy(s_cli_pending + s_cli_pending_length, data, count);
+        s_cli_pending_length += count;
+        if (s_cli_pending_length == sizeof(s_cli_pending) - 1) flush_cli_pending();
+        portEXIT_CRITICAL(&s_mux);
+        data += count;
+        length -= count;
     }
 }
 
-static int log_output(const char *format, va_list args)
+#define CONSOLE_TEE_PATH "/dev/brcli"
+static int s_console_fd = -1;
+static FILE *s_output[2];
+static __thread bool s_forwarding;
+
+static int tee_open(const char *path, int flags, int mode)
 {
-    capture('L', format, args);
-    bool forwarding = s_forwarding_log;
-    s_forwarding_log = true;
-    int result = s_log_output ? s_log_output(format, args) : vprintf(format, args);
-    s_forwarding_log = forwarding;
-    return result;
+    if ((flags & O_ACCMODE) != O_WRONLY) {
+        errno = EACCES;
+        return -1;
+    }
+    return strcmp(path, "/stderr") == 0 ? 1 : 0;
+}
+
+static int tee_close(int fd)
+{
+    return 0; // Firmware-lifetime shared backend, not owned by an individual FILE.
+}
+
+static ssize_t tee_write(int fd, const void *data, size_t length)
+{
+    // Fixed 80 columns for both inputs. Fail BEFORE sending the SDK's query,
+    // so getColumns() falls back without reading stdin or moving the cursor.
+    static const char query[] = "\x1b[6n";
+    if (length == sizeof(query) && memcmp(data, query, sizeof(query)) == 0) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    if (s_forwarding) return length; // Do not recurse on driver diagnostics.
+    FILE *stream = s_output[fd];
+    // Reuse libc's recursive FILE lock; an extra output mutex would invert locks.
+    flockfile(stream);
+    s_forwarding = true;
+    ssize_t written = write(s_console_fd, data, length);
+    int saved_errno = errno;
+    if (written > 0) append_console_bytes(data, (size_t)written);
+    s_forwarding = false;
+    funlockfile(stream);
+    errno = saved_errno;
+    return written;
+}
+
+static int tee_fstat(int fd, struct stat *info)
+{
+    return fstat(s_console_fd, info);
+}
+
+static int tee_fcntl(int fd, int command, int argument)
+{
+    return fcntl(s_console_fd, command, argument);
+}
+
+static int tee_fsync(int fd)
+{
+    return fsync(s_console_fd);
+}
+
+static void tee_reopen(FILE *stream, const char *path)
+{
+    flockfile(stream);
+    if (!freopen(path, "w", stream) || setvbuf(stream, NULL, _IONBF, 0) != 0) abort();
+    funlockfile(stream);
+}
+
+static esp_err_t console_tee_init(void)
+{
+    s_console_fd = open(ESP_VFS_DEV_CONSOLE, O_WRONLY);
+    if (s_console_fd < 0) return ESP_FAIL;
+    const esp_vfs_t vfs = {
+        .flags = ESP_VFS_FLAG_DEFAULT,
+        .open = tee_open,
+        .close = tee_close,
+        .write = tee_write,
+        .fstat = tee_fstat,
+        .fcntl = tee_fcntl,
+        .fsync = tee_fsync,
+    };
+    esp_err_t result = esp_vfs_register(CONSOLE_TEE_PATH, &vfs, NULL);
+    if (result != ESP_OK) {
+        close(s_console_fd);
+        s_console_fd = -1;
+        return result;
+    }
+    s_output[0] = stdout;
+    s_output[1] = stderr;
+    // Reopen IN PLACE: Picolibc globals and existing tasks' TLS aliases share FILE.
+    // After destructive freopen failure the original stream cannot be restored.
+    tee_reopen(stdout, CONSOLE_TEE_PATH "/stdout");
+    if (stderr != stdout) tee_reopen(stderr, CONSOLE_TEE_PATH "/stderr");
+    return ESP_OK;
 }
 
 void esp_br_web_cli_init(void)
 {
-    // Called once during application startup, before the serial console starts.
-    if (!s_console_mutex) {
-        s_console_mutex = xSemaphoreCreateMutex();
-    }
-    s_ready = s_console_mutex != NULL;
-    if (!s_log_output) {
-        s_session = esp_random();
-        s_log_output = esp_log_set_vprintf(log_output);
-    }
+    static bool initialized;
+    if (initialized) return;
+    initialized = true;
+    s_session = esp_random();
+    s_ready = console_tee_init() == ESP_OK;
+    if (!s_ready) ESP_LOGE("br_web_cli", "Cannot capture console output");
 }
 
-/* esp_console_run uses shared parsing/argtable storage. Route both the serial
- * REPL and the Web worker through this wrapper and reject concurrent commands.
- * The registered OT handler retains IDF's normal queue and completion wait. */
-esp_err_t __real_esp_console_run(const char *line, int *command_result);
-
-static int console_write(void *context, const char *text, int length)
+bool esp_br_web_cli_capture_ready(void)
 {
-    if (!s_forwarding_log) {
-        for (int offset = 0; offset < length;) {
-            char part[RECORD_SIZE];
-            size_t count = (size_t)(length - offset);
-            if (count >= sizeof(part)) {
-                count = sizeof(part) - 1;
-                /* Do not split a UTF-8 character between JSON strings. */
-                while (count && ((unsigned char)text[offset + count] & 0xc0) == 0x80) count--;
-                if (!count) count = sizeof(part) - 1;
-            }
-            memcpy(part, text + offset, count);
-            part[count] = 0;
-            append_record('C', part);
-            offset += count;
-        }
-    }
-    /* Forward captured text to the original serial stream. */
-    return (int)fwrite(text, 1, length, (FILE *)context);
-}
-
-esp_err_t __wrap_esp_console_run(const char *line, int *command_result)
-{
-    if (!s_console_mutex || xSemaphoreTake(s_console_mutex, 0) != pdTRUE) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    FILE *original_stdout = stdout, *original_stderr = stderr;
-    FILE *captured_stdout = funopen(original_stdout, NULL, console_write, NULL, NULL);
-    FILE *captured_stderr = funopen(original_stderr, NULL, console_write, NULL, NULL);
-    if (!captured_stdout || !captured_stderr) {
-        if (captured_stdout) fclose(captured_stdout);
-        if (captured_stderr) fclose(captured_stderr);
-        xSemaphoreGive(s_console_mutex);
-        return ESP_ERR_NO_MEM;
-    }
-    setvbuf(captured_stdout, NULL, _IONBF, 0);
-    setvbuf(captured_stderr, NULL, _IONBF, 0);
-    /* The current SDK uses shared stdout/stderr, so OT task output also passes through this tee. */
-    stdout = captured_stdout;
-    stderr = captured_stderr;
-    append_record('I', line);
-    esp_err_t result = __real_esp_console_run(line, command_result);
-    stdout = original_stdout;
-    stderr = original_stderr;
-    fclose(captured_stdout);
-    fclose(captured_stderr);
-    xSemaphoreGive(s_console_mutex);
-    return result;
-}
-
-static void console_worker(void *arg)
-{
-    char *line = arg;
-    int command_result = 0;
-    esp_err_t result = __wrap_esp_console_run(line, &command_result);
-
-    char message[128] = {0};
-    if (result == ESP_ERR_NOT_FOUND) {
-        snprintf(message, sizeof(message), "\r\n[Console: unrecognized command]\r\n");
-    } else if (result == ESP_ERR_INVALID_STATE) {
-        snprintf(message, sizeof(message), "\r\n[Console: busy or unavailable; command was not executed]\r\n");
-    } else if (result != ESP_OK) {
-        snprintf(message, sizeof(message), "\r\n[Console: %s]\r\n", esp_err_to_name(result));
-    } else if (command_result != 0) {
-        snprintf(message, sizeof(message), "\r\n[Console: command returned %d]\r\n", command_result);
-    } else {
-        message[0] = 0;
-    }
-    if (message[0]) {
-        append_record('C', message);
-    }
-
-    free(line);
-    atomic_store(&s_worker_busy, false);
-    vTaskDelete(NULL);
+    return s_ready;
 }
 
 /* HTTPD sends headers and chunk framing separately. Disable Nagle for these
@@ -347,6 +317,30 @@ static void stream_complete(cli_stream_t *stream)
     stream_release();
 }
 
+// Prepare a JSON string at the sender, leaving the raw ring untouched.
+// NUL is not log text; retain at most three unfinished UTF-8 bytes for next time.
+static void stream_text(const cli_ring_record_t *record, char *text, char *tail, size_t *tail_length)
+{
+    size_t length = *tail_length;
+    memcpy(text, tail, length);
+    for (size_t i = 0; i < record->length; i++) {
+        if (record->text[i]) text[length++] = record->text[i];
+    }
+    size_t complete = length;
+    if (length) {
+        size_t start = length - 1;
+        while (start && ((unsigned char)text[start] & 0xc0) == 0x80) start--;
+        unsigned char lead = (unsigned char)text[start];
+        size_t expected = lead >= 0xc2 && lead <= 0xdf ? 2 :
+                          lead >= 0xe0 && lead <= 0xef ? 3 :
+                          lead >= 0xf0 && lead <= 0xf4 ? 4 : 1;
+        if (length - start < expected) complete = start;
+    }
+    *tail_length = length - complete;
+    memcpy(tail, text + complete, *tail_length);
+    text[complete] = '\0';
+}
+
 static void stream_worker(void *arg)
 {
     cli_stream_t *stream = arg;
@@ -355,6 +349,8 @@ static void stream_worker(void *arg)
     bool initial = true, last_ready = false;
     TickType_t heartbeat = xTaskGetTickCount();
     cli_ring_reader_t reader;
+    char tail[4];
+    size_t tail_length = 0;
     portENTER_CRITICAL(&s_mux);
     reader = cli_ring_begin(&s_ring);
     portEXIT_CRITICAL(&s_mux);
@@ -370,7 +366,7 @@ static void stream_worker(void *arg)
         bool stopping = s_stream_stopping;
         uint64_t first = s_ring.first_seq, end = s_ring.next_seq;
         cli_ring_reader_t begin = cli_ring_begin(&s_ring);
-        bool ready = s_ready;
+        bool ready = s_ready && esp_br_web_cli_input_ready();
         portEXIT_CRITICAL(&s_mux);
         if (stopping) break;
         /* HTTPD excludes async sockets from its read loop. Detect FIN here so
@@ -388,7 +384,10 @@ static void stream_worker(void *arg)
             if (!initial || cursor != 0) event = "gap";
             cursor = first - 1;
         }
-        if (event || initial || reader.seq < first) reader = begin;
+        if (event || initial || reader.seq < first) {
+            reader = begin;
+            tail_length = 0;
+        }
         if (event) {
             err = stream_event(req, event, cursor, stream_payload(cursor, ready));
             if (err != ESP_OK) break;
@@ -412,17 +411,19 @@ static void stream_worker(void *arg)
                 cli_ring_record_t record;
                 bool skip = reader.seq <= cursor;
                 portENTER_CRITICAL(&s_mux);
-                bool found = cli_ring_read(&s_ring, &reader, skip ? NULL : &record);
+                bool found = cli_ring_read(&s_ring, &reader, &record);
                 portEXIT_CRITICAL(&s_mux);
                 if (!found) break; /* Next iteration sends gap and repositions. */
+                char text[CLI_RING_TEXT_SIZE + 4];
+                // Rebuild text state while seeking, without replaying old text.
+                stream_text(&record, text, tail, &tail_length);
                 if (skip) continue;
                 char seq[24];
                 snprintf(seq, sizeof(seq), "%" PRIu64, record.seq);
                 cJSON *item = cJSON_CreateObject();
                 if (!item || !cJSON_AddStringToObject(item, "seq", seq) ||
-                    !cJSON_AddStringToObject(item, "source", record.source == 'L' ? "log" :
-                                            record.source == 'I' ? "input" : "cli") ||
-                    !cJSON_AddStringToObject(item, "text", record.text) || !cJSON_AddItemToArray(records, item)) {
+                    !cJSON_AddStringToObject(item, "source", "cli") ||
+                    !cJSON_AddStringToObject(item, "text", text) || !cJSON_AddItemToArray(records, item)) {
                     cJSON_Delete(item);
                     err = ESP_ERR_NO_MEM;
                     break;
@@ -523,18 +524,11 @@ esp_err_t esp_br_web_cli_events_handler(httpd_req_t *req)
 
 esp_err_t esp_br_web_cli_post_handler(httpd_req_t *req)
 {
-    if (!s_console_mutex) {
+    if (!s_ready || !esp_br_web_cli_input_ready()) {
         return httpd_resp_send_custom_err(req, "503 Service Unavailable", "Console unavailable");
     }
 
-    // Reserve the single command slot before reading or parsing the request body.
-    bool expected = false;
-    if (!atomic_compare_exchange_strong(&s_worker_busy, &expected, true)) {
-        return httpd_resp_send_custom_err(req, "503 Service Unavailable", "A Web command is still running");
-    }
-
     cJSON *json = NULL;
-    char *copy = NULL;
     httpd_err_code_t error_code = HTTPD_400_BAD_REQUEST;
     const char *error_message = NULL;
 
@@ -581,7 +575,8 @@ esp_err_t esp_br_web_cli_post_handler(httpd_req_t *req)
         goto exit;
     }
     const char *line = command->valuestring;
-    if (strlen(line) >= WEB_CLI_COMMAND_SIZE) {
+    size_t command_length = strlen(line);
+    if (command_length >= WEB_CLI_COMMAND_SIZE) {
         error_message = "Expected a command of 1-255 bytes";
         goto exit;
     }
@@ -601,22 +596,16 @@ esp_err_t esp_br_web_cli_post_handler(httpd_req_t *req)
         goto exit;
     }
 
-    copy = strdup(line);
-    if (!copy) {
-        error_code = HTTPD_500_INTERNAL_SERVER_ERROR;
-        error_message = "Cannot copy console command";
-        goto exit;
-    }
+    // Copy into the fixed input slot before freeing the request's JSON.
+    esp_err_t submitted = esp_br_web_cli_submit(line, command_length);
     cJSON_Delete(json);
     json = NULL;
-
-    if (xTaskCreate(console_worker, "br_web_console", 8192, copy, tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
-        error_code = HTTPD_500_INTERNAL_SERVER_ERROR;
-        error_message = "Cannot start console command";
-        goto exit;
+    if (submitted != ESP_OK) {
+        return httpd_resp_send_custom_err(req, "503 Service Unavailable",
+                                         submitted == ESP_ERR_TIMEOUT ? "Console input buffer is full" : "Console unavailable");
     }
 
-    // The worker owns copy and the command slot, even if sending the response fails.
+    // 202 means accepted, not executed. Response failure does not retract input.
     ESP_RETURN_ON_ERROR(httpd_resp_set_status(req, "202 Accepted"), "br_web_cli", "Failed to set response status");
     ESP_RETURN_ON_ERROR(httpd_resp_set_hdr(req, "Cache-Control", "no-store"), "br_web_cli",
                         "Failed to set cache control");
@@ -624,7 +613,5 @@ esp_err_t esp_br_web_cli_post_handler(httpd_req_t *req)
 
 exit:
     cJSON_Delete(json);
-    free(copy);
-    atomic_store(&s_worker_busy, false);
     return httpd_resp_send_err(req, error_code, error_message);
 }

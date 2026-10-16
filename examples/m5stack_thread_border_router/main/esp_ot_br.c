@@ -60,6 +60,10 @@ void app_main(void)
     // * task queue
     // * border router
     size_t max_eventfd = 3;
+#if CONFIG_ESP_BR_WEB_CLI
+    // * Web command wakeup (consumed by the existing console task)
+    max_eventfd++;
+#endif
 
 #if CONFIG_OPENTHREAD_RADIO_SPINEL_SPI
     // * SpiSpinelInterface (The Spi Spinel Interface needs an eventfd.)
